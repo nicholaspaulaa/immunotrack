@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  collector-service:
+    build: ./collector-service
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - immunotrack-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  sensor-service:
+    build: ./sensor-service
+    environment:
+      - COLLECTOR_URL=http://collector-service:8000
+      - SENSOR_ID=sensor-001
+      - INTERVAL=10
+      - PYTHONUNBUFFERED=1
+    networks:
+      - immunotrack-network
+    depends_on:
+      collector-service:
+        condition: service_healthy
+
+networks:
+  immunotrack-network:
+    driver: bridge
