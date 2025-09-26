@@ -6,6 +6,10 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List
 import os
+from dotenv import load_dotenv
+
+# Carregar variáveis de ambiente do arquivo .env
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,16 +50,22 @@ def notificar_alerta_aws(alerta_dict):
     try:
         # Verificar se AWS está configurado
         if not os.getenv('AWS_ACCESS_KEY_ID'):
-            logger.info("AWS não configurado - pulando notificação")
-            return
+            logger.warning("AWS não configurado - configure suas credenciais no arquivo .env")
+            return False
         
-        # Importar e usar o sistema de notificações
+        # Importar e usar o sistema de notificações AWS
+        import sys
+        import os as os_module
+        sys.path.append(os_module.path.dirname(os_module.path.dirname(os_module.path.abspath(__file__))))
         from notificacoes_aws import notificar_alerta_critico
+        
         notificar_alerta_critico(alerta_dict)
         logger.info("Notificação AWS enviada com sucesso")
+        return True
         
     except Exception as e:
         logger.error(f"Erro ao enviar notificação AWS: {e}")
+        return False
 
 def criar_alerta_emergencia(id_sensor: str, temperatura: float, tipo_alerta: str, mensagem: str):
     """Cria um alerta de emergência"""
@@ -150,7 +160,7 @@ def pagina_saude():
     <body>
         <div class="container">
             <h1>Status do Sistema ImmunoTrack</h1>
-            <div class="status">✅ Sistema Saudável</div>
+            <div class="status">Sistema Saudável</div>
             <div class="info">
                 <strong>Serviço:</strong> Serviço Coletor<br>
                 <strong>Status:</strong> Saudável<br>
@@ -289,7 +299,7 @@ def pagina_simular_emergencia():
             <h1>Simular Emergência</h1>
             
             <div class="success">
-                <h3>✅ Alerta de Emergência Simulado com Sucesso!</h3>
+                <h3>Alerta de Emergência Simulado com Sucesso!</h3>
                 <p>Um novo alerta foi criado para demonstração do sistema.</p>
             </div>
             
@@ -305,7 +315,7 @@ def pagina_simular_emergencia():
             
             <div>
                 <a href="/visualizar" class="back-btn">← Voltar ao Dashboard</a>
-                <a href="/simular-emergencia" class="simular-btn">🔄 Simular Outro Alerta</a>
+                <a href="/simular-emergencia" class="simular-btn">Simular Outro Alerta</a>
                 <a href="/alertas-pagina" class="back-btn">Ver Todos os Alertas</a>
             </div>
         </div>
@@ -587,14 +597,14 @@ def painel_visual():
                     <a href="/temperaturas-pagina" class="link-btn">Todas Leituras</a>
                     <a href="/alertas-pagina" class="link-btn" style="background: {'#e74c3c' if total_alertas > 0 else '#27ae60'}">Alertas ({total_alertas})</a>
                     <a href="/simular-emergencia" class="link-btn" style="background: #f39c12; color: white;">Simular Emergência</a>
-                    <a href="/testar-notificacoes" class="link-btn" style="background: #9b59b6; color: white;">📱 Notificações AWS</a>
+                    <a href="/testar-notificacoes" class="link-btn" style="background: #9b59b6; color: white;">📧 Notificações AWS</a>
                 </div>
                 <div style="margin-top: 15px; font-size: 12px; color: #7f8c8d;">
                     <strong>Status do Sistema:</strong> Verifica se o serviço está funcionando<br>
                     <strong>Todas Leituras:</strong> Lista completa de temperaturas coletadas<br>
                     <strong>Alertas:</strong> Lista de emergências e problemas detectados<br>
                     <strong>Simular Emergência:</strong> Cria um alerta de teste para demonstração<br>
-                    <strong>Notificações AWS:</strong> Configura e testa SMS/Email para celular
+                    <strong>Notificações AWS:</strong> Configura e testa Email para notificações
                 </div>
             </div>
         </div>
@@ -739,12 +749,17 @@ def simular_emergencia():
 
 @app.get("/testar-notificacoes", response_class=HTMLResponse, tags=["Teste"])
 def testar_notificacoes():
-    """Página para testar notificações AWS"""
+    """Página para configurar notificações AWS"""
+    # Verificar status AWS
+    aws_configurado = bool(os.getenv('AWS_ACCESS_KEY_ID') and os.getenv('AWS_SECRET_ACCESS_KEY'))
+    email_configurado = bool(os.getenv('EMAIL_NOTIFICACAO'))
+    
     conteudo = f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Testar Notificações AWS - ImmunoTrack</title>
+        <title>Configurar Notificações AWS - ImmunoTrack</title>
+        <meta http-equiv="refresh" content="10">
         <style>
             body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
             .container {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
@@ -754,47 +769,43 @@ def testar_notificacoes():
             .btn {{ background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; margin: 10px; display: inline-block; }}
             .btn-success {{ background: #28a745; }}
             .btn-warning {{ background: #ffc107; color: #212529; }}
+            .btn-danger {{ background: #dc3545; }}
+            .config-section {{ background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; }}
+            .step {{ margin: 15px 0; padding: 10px; background: white; border-radius: 5px; border-left: 4px solid #007bff; }}
+            .code {{ background: #e9ecef; padding: 10px; border-radius: 5px; font-family: monospace; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🧪 Testar Notificações AWS</h1>
+            <h1>📱 Configurar Notificações AWS</h1>
             
-            <div class="status {'configurado' if os.getenv('AWS_ACCESS_KEY_ID') else 'nao-configurado'}">
-                <h3>{'✅ AWS Configurado' if os.getenv('AWS_ACCESS_KEY_ID') else '❌ AWS Não Configurado'}</h3>
-                <p>{'Suas credenciais AWS estão configuradas!' if os.getenv('AWS_ACCESS_KEY_ID') else 'Configure suas credenciais AWS para usar notificações.'}</p>
+            <div class="status {'configurado' if aws_configurado else 'nao-configurado'}">
+                <h3>{'AWS Configurado' if aws_configurado else 'AWS Não Configurado'}</h3>
+                <p>{'Suas credenciais AWS estão configuradas! Email funcionando.' if aws_configurado else 'Configure suas credenciais AWS para receber notificações por email.'}</p>
             </div>
             
-            <h3>📱 Tipos de Notificação:</h3>
-            <ul>
-                <li><strong>SMS:</strong> Apenas para alertas CRÍTICOS</li>
-                <li><strong>Email:</strong> Para todos os alertas</li>
-                <li><strong>Dashboard:</strong> Sempre atualizado</li>
-            </ul>
+            <div class="config-section">
+                <h3>📊 Status da Configuração:</h3>
+                <ul>
+                    <li><strong>AWS Credentials:</strong> {'Configurado' if aws_configurado else 'Não configurado'}</li>
+                    <li><strong>Email:</strong> {'Configurado' if email_configurado else 'Não configurado'}</li>
+                </ul>
+            </div>
             
-            <h3>🔧 Como Configurar:</h3>
-            <ol>
-                <li>Crie uma conta AWS gratuita</li>
-                <li>Configure AWS CLI: <code>aws configure</code></li>
-                <li>Crie arquivo .env com suas credenciais</li>
-                <li>Teste as notificações abaixo</li>
-            </ol>
             
             <div>
-                <a href="/simular-emergencia" class="btn btn-success">🚨 Simular Alerta Crítico</a>
-                <a href="/alertas-pagina" class="btn">📋 Ver Alertas</a>
-                <a href="/visualizar" class="btn">🏠 Dashboard</a>
+                <a href="/simular-emergencia" class="btn btn-success">Testar Notificação</a>
+                <a href="/alertas-pagina" class="btn">Ver Alertas</a>
+                <a href="/visualizar" class="btn">Dashboard</a>
             </div>
             
-            <div style="margin-top: 30px; padding: 20px; background: #e9ecef; border-radius: 8px;">
-                <h4>📞 Configuração de Telefone:</h4>
-                <p>Formato: <code>+5511999999999</code> (Brasil)</p>
-                <p>Variável: <code>TELEFONE_NOTIFICACAO</code></p>
-                
-                <h4>📧 Configuração de Email:</h4>
-                <p>Formato: <code>seu-email@exemplo.com</code></p>
-                <p>Variável: <code>EMAIL_NOTIFICACAO</code></p>
+            {f'''
+            <div class="config-section">
+                <h3>Configuração Atual:</h3>
+                <p><strong>Email:</strong> {os.getenv('EMAIL_NOTIFICACAO', 'Não configurado')}</p>
+                <p><strong>Região AWS:</strong> {os.getenv('AWS_REGION', 'Não configurado')}</p>
             </div>
+            ''' if aws_configurado else ''}
         </div>
     </body>
     </html>

@@ -1,3 +1,19 @@
+# Arquivos de configuração com credenciais
+.env
+.env.local
+.env.production
+.env.staging
+
+# Credenciais AWS
+*.pem
+*.key
+credentials.txt
+configurar-credenciais.txt
+
+# Logs
+*.log
+logs/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,30 +35,33 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# Virtual Environment
+# Virtual environments
 venv/
 env/
 ENV/
-
-# Environment variables
-.env
-.env.local
-.env.production
+env.bak/
+venv.bak/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Logs
-*.log
-logs/
-
-# Docker
-.dockerignore
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/

@@ -1,6 +1,6 @@
 """
 Sistema de Notificações AWS para ImmunoTrack
-Envia SMS e email quando há alertas críticos
+Envia email quando há alertas críticos
 """
 
 import boto3
@@ -48,7 +48,7 @@ class NotificadorAWS:
         try:
             # Formatar mensagem
             mensagem = f"""
-🚨 ALERTA CRÍTICO IMMUNOTRACK 🚨
+ALERTA CRÍTICO IMMUNOTRACK
 
 Tipo: {alerta['tipo_alerta']}
 Sensor: {alerta['id_sensor']}
@@ -85,7 +85,7 @@ Ação necessária: Verificar refrigerador imediatamente!
             mensagem_html = f"""
             <html>
             <body>
-                <h2 style="color: #e74c3c;">🚨 ALERTA IMMUNOTRACK 🚨</h2>
+                <h2 style="color: #e74c3c;">ALERTA IMMUNOTRACK</h2>
                 
                 <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
                     <h3>Detalhes do Alerta:</h3>
@@ -130,8 +130,7 @@ Ação necessária: Verificar refrigerador imediatamente!
     
     def get_topic_arn_email(self):
         """Obtém o ARN do tópico SNS para email"""
-        # Você precisa criar um tópico SNS primeiro
-        # Este é um exemplo - substitua pelo seu ARN real
+        # Coloque o ARN do email
         return os.getenv('SNS_TOPIC_ARN_EMAIL', 'arn:aws:sns:us-east-1:123456789012:immunotrack-alerts')
     
     def criar_topico_sns(self, nome_topico):
@@ -173,20 +172,4 @@ def notificar_alerta_critico(alerta):
 
 # Exemplo de uso
 if __name__ == "__main__":
-    # Configurar variáveis de ambiente
-    os.environ['AWS_ACCESS_KEY_ID'] = 'SUA_ACCESS_KEY'
-    os.environ['AWS_SECRET_ACCESS_KEY'] = 'SUA_SECRET_KEY'
-    os.environ['TELEFONE_NOTIFICACAO'] = '+5511999999999'
-    os.environ['EMAIL_NOTIFICACAO'] = 'seu-email@exemplo.com'
-    
-    # Testar notificação
-    alerta_teste = {
-        'tipo_alerta': 'TEMPERATURA_CRITICA',
-        'id_sensor': 'sensor-001',
-        'temperatura': 15.5,
-        'severidade': 'CRITICO',
-        'mensagem': 'Temperatura crítica detectada!',
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    notificar_alerta_critico(alerta_teste)
+    import os as os_module

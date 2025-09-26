@@ -3,8 +3,15 @@ services:
     build: ./collector-service
     ports:
       - "8000:8000"
+    env_file:
+      - ./collector-service/.env
     environment:
       - PYTHONUNBUFFERED=1
+      - AWS_REGION=us-east-1
+      - EMAIL_NOTIFICACAO=icraftgamer@gmail.com
+      - SNS_TOPIC_ARN_EMAIL=arn:aws:sns:us-east-1:985798502313:immunotrack-alerts
+      - DEBUG=True
+      - LOG_LEVEL=INFO
     networks:
       - immunotrack-network
     healthcheck:
