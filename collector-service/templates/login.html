@@ -240,7 +240,12 @@
             const formData = new FormData(form);
             const username = formData.get('username');
             const password = formData.get('password');
+<<<<<<< HEAD
         
+=======
+            
+            // Show loading state
+>>>>>>> 6f7277b954a34847523da0ece1470dc0f19f8ace
             document.getElementById('loginBtn').style.display = 'none';
             document.getElementById('loading').style.display = 'block';
             hideMessages();
@@ -260,9 +265,17 @@
                 const data = await response.json();
                 
                 if (response.ok) {
+<<<<<<< HEAD
                     localStorage.setItem('access_token', data.access_token);
                     showSuccess('Login realizado com sucesso! Redirecionando...');
                     
+=======
+                    // Store token in localStorage
+                    localStorage.setItem('access_token', data.access_token);
+                    showSuccess('Login realizado com sucesso! Redirecionando...');
+                    
+                    // Redirect to dashboard after short delay
+>>>>>>> 6f7277b954a34847523da0ece1470dc0f19f8ace
                     setTimeout(() => {
                         window.location.href = '/dashboard';
                     }, 1500);
@@ -278,6 +291,10 @@
             }
         }
 
+<<<<<<< HEAD
+=======
+        // Check if user is already logged in
+>>>>>>> 6f7277b954a34847523da0ece1470dc0f19f8ace
         window.addEventListener('load', function() {
             const token = localStorage.getItem('access_token');
             if (token) {
