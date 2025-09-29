@@ -23,15 +23,15 @@ class NotificadorAWS:
             self.sns_client = boto3.client(
                 'sns',
                 region_name=self.region,
-                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+                aws_access_key_id=os.getenv('xx'),
+                aws_secret_access_key=os.getenv('xx')
             )
             
-            # Número de telefone para notificações (formato internacional)
-            self.numero_telefone = os.getenv('TELEFONE_NOTIFICACAO', '+5511999999999')
+            # Número de telefone para notificações
+            self.numero_telefone = os.getenv('TELEFONE_NOTIFICACAO', '+xx')
             
             # Email para notificações
-            self.email_notificacao = os.getenv('EMAIL_NOTIFICACAO', 'seu-email@exemplo.com')
+            self.email_notificacao = os.getenv('EMAIL_NOTIFICACAO', 'xx')
             
             logger.info("Cliente AWS SNS configurado com sucesso")
             
