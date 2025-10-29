@@ -7,6 +7,11 @@ from datetime import datetime, timezone, timedelta
 from typing import List
 import os
 from dotenv import load_dotenv
+import asyncio
+import socket
+
+from dynamodb_basic import DynamoDBService
+from notificacoes_aws import notificar_alerta_critico
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
@@ -42,8 +47,41 @@ class AlertaEmergencia(BaseModel):
 
 dados_temperatura = []
 
-# Lista para armazenar alertas de emergência
+# Lista para armazenar alertas de emergência (mantida para compatibilidade visual)
 alertas_emergencia = []
+
+# DynamoDB e liderança
+db_service = None
+owner_id = socket.gethostname()
+is_lider_atual = False
+LEASE_TTL_SECONDS = int(os.getenv('LEADER_TTL_SECONDS', '20'))
+
+async def _loop_eleicao_lider():
+    global is_lider_atual
+    # Jitter inicial
+    await asyncio.sleep(1)
+    while True:
+        try:
+            if not is_lider_atual:
+                conquistou = db_service.adquirir_lease_lider(owner_id, LEASE_TTL_SECONDS)
+                is_lider_atual = conquistou
+                if is_lider_atual:
+                    logger.info(f"[LIDERANCA] Instância {owner_id} virou LÍDER")
+            else:
+                renovou = db_service.renovar_lease_lider(owner_id, LEASE_TTL_SECONDS)
+                if not renovou:
+                    logger.warning("[LIDERANCA] Perdi a liderança")
+                    is_lider_atual = False
+        except Exception as e:
+            logger.error(f"[LIDERANCA] Erro no loop de eleição: {e}")
+        # Pequeno jitter para evitar sincronização
+        await asyncio.sleep(max(5, LEASE_TTL_SECONDS // 2))
+
+@app.on_event("startup")
+async def on_startup():
+    global db_service
+    db_service = DynamoDBService()
+    asyncio.create_task(_loop_eleicao_lider())
 
 def notificar_alerta_aws(alerta_dict):
     """Envia notificação via AWS SNS para alertas críticos"""
@@ -52,13 +90,7 @@ def notificar_alerta_aws(alerta_dict):
         if not os.getenv('AWS_ACCESS_KEY_ID'):
             logger.warning("AWS não configurado - configure suas credenciais no arquivo .env")
             return False
-        
-        # Importar e usar o sistema de notificações AWS
-        import sys
-        import os as os_module
-        sys.path.append(os_module.path.dirname(os_module.path.dirname(os_module.path.abspath(__file__))))
-        from notificacoes_aws import notificar_alerta_critico
-        
+
         notificar_alerta_critico(alerta_dict)
         logger.info("Notificação AWS enviada com sucesso")
         return True
@@ -94,10 +126,35 @@ def criar_alerta_emergencia(id_sensor: str, temperatura: float, tipo_alerta: str
     
     alertas_emergencia.append(alerta.dict())
     logger.warning(f"ALERTA DE EMERGÊNCIA: {mensagem} - Sensor: {id_sensor} - Temperatura: {temperatura}°C")
-    
-    # Enviar notificação AWS para alertas críticos
+
+    # Persistir no DynamoDB
+    try:
+        if db_service:
+            salvo = db_service.salvar_alerta(
+                id_sensor=id_sensor,
+                temperatura=temperatura,
+                tipo_alerta=tipo_alerta,
+                mensagem=mensagem,
+                severidade=severidade
+            )
+            # Atualiza id_alerta com id persistido (usado para mutex de notificação)
+            alerta.id_alerta = salvo.get('id', alerta.id_alerta)
+    except Exception as e:
+        logger.error(f"Erro ao salvar alerta no DynamoDB: {e}")
+
+    # Enviar notificação AWS para alertas críticos somente se líder e send-once
     if severidade == "CRITICO":
-        notificar_alerta_aws(alerta.dict())
+        try:
+            if db_service and is_lider_atual:
+                if db_service.marcar_alerta_notificado_uma_vez(alerta.id_alerta):
+                    notificar_alerta_aws(alerta.dict())
+                else:
+                    logger.info("Notificação já enviada por outra instância")
+            elif is_lider_atual:
+                # Sem DB (fallback): envia mesmo assim
+                notificar_alerta_aws(alerta.dict())
+        except Exception as e:
+            logger.error(f"Erro ao processar notificação crítica: {e}")
     
     return alerta
 
@@ -125,8 +182,9 @@ def raiz():
 
 @app.get("/painel", tags=["Painel"])
 def painel():
-    contador = len(dados_temperatura)
-    ultimo = dados_temperatura[-1] if dados_temperatura else None
+    # Preferir dados do DB
+    ultimo = db_service.obter_ultima_temperatura() if db_service else (dados_temperatura[-1] if dados_temperatura else None)
+    contador = (db_service.contar_temperaturas() if db_service else len(dados_temperatura))
     
     return {
         "status_sistema": "ONLINE",
@@ -135,7 +193,9 @@ def painel():
         "status_sensor": "ATIVO" if contador > 0 else "AGUARDANDO",
         "ultima_atualizacao": datetime.now().isoformat(),
         "faixa_temperatura": "2.0°C - 8.0°C",
-        "intervalo_atualizacao": "10 segundos"
+        "intervalo_atualizacao": "10 segundos",
+        "lider": is_lider_atual,
+        "owner_id": owner_id
     }
 
 @app.get("/saude-pagina", response_class=HTMLResponse, tags=["Visual"])
@@ -330,8 +390,9 @@ def painel_visual():
     ultimo = dados_temperatura[-1] if dados_temperatura else None
     
     # Calcular estatísticas
-    if dados_temperatura:
-        temperaturas = [d['temperatura'] for d in dados_temperatura]
+    dados_origem = (db_service.obter_todas_temperaturas(limite=100) if db_service else dados_temperatura)
+    if dados_origem:
+        temperaturas = [d['temperatura'] for d in dados_origem]
         temp_media = round(sum(temperaturas) / len(temperaturas), 2)
         temp_min = min(temperaturas)
         temp_max = max(temperaturas)
@@ -339,9 +400,10 @@ def painel_visual():
         temp_media = temp_min = temp_max = 0
     
     # Estatísticas de alertas
-    total_alertas = len(alertas_emergencia)
-    alertas_criticos = len([a for a in alertas_emergencia if a['severidade'] == 'CRITICO'])
-    ultimo_alerta = alertas_emergencia[-1] if alertas_emergencia else None
+    alertas_origem = (db_service.obter_todos_alertas(limite=50) if db_service else alertas_emergencia)
+    total_alertas = len(alertas_origem)
+    alertas_criticos = len([a for a in alertas_origem if a['severidade'] == 'CRITICO'])
+    ultimo_alerta = alertas_origem[0] if alertas_origem else None
     
     # Horário GMT-3 (Brasília)
     fuso_brasilia = timezone(timedelta(hours=-3))
@@ -510,7 +572,7 @@ def painel_visual():
                 </h2>
             </div>
             
-            {f'''
+            {f''' 
             <div class="emergency-alert alert-{ultimo_alerta['severidade'].lower()}">
                 <h3>ALERTA DE EMERGÊNCIA - {ultimo_alerta['severidade']}</h3>
                 <p><strong>Sensor:</strong> {ultimo_alerta['id_sensor']}</p>
@@ -529,7 +591,7 @@ def painel_visual():
                 
                 <div class="data-box">
                     <h3>Temperatura Atual</h3>
-                    {f'''
+                    {f''' 
                     <div class="temperature">{ultimo['temperatura']}°C</div>
                     <div class="sensor-info">
                         <strong>Sensor:</strong> {ultimo['id_sensor']}<br>
@@ -549,7 +611,7 @@ def painel_visual():
                     <div class="stat-value">Média: {temp_media}°C</div>
                     <div class="stat-value">Mín: {temp_min}°C</div>
                     <div class="stat-value">Máx: {temp_max}°C</div>
-                    ''' if dados_temperatura else '''
+                    ''' if dados_origem else '''
                     <div class="stat-value">Sem dados</div>
                     <div class="stat-value">--</div>
                     <div class="stat-value">--</div>
@@ -573,7 +635,7 @@ def painel_visual():
                 </div>
             </div>
             
-            {f'''
+            {f''' 
             <div class="data-box">
                 <h3>Detalhes da Última Leitura</h3>
                 <div class="sensor-info">
@@ -622,8 +684,8 @@ def verificar_saude():
     return RespostaSaude(
         status="saudavel",
         timestamp=agora_brasilia.isoformat(),
-        servico="servico-coletor",
-        contador_dados=len(dados_temperatura)
+        servico=("servico-coletor-lider" if is_lider_atual else "servico-coletor-seguidor"),
+        contador_dados=(db_service.contar_temperaturas() if db_service else len(dados_temperatura))
     )
 
 @app.post("/api/temperatura", tags=["Temperatura"])
@@ -651,6 +713,12 @@ def receber_temperatura(dados: DadosTemperatura):
         
         logger.info(f"Recebido dados do sensor {dados.id_sensor}: {dados.temperatura}°C")
         dados_temperatura.append(dados.dict())
+        # Persistir no DynamoDB
+        if db_service:
+            try:
+                db_service.salvar_temperatura(dados.id_sensor, dados.temperatura, dados.timestamp)
+            except Exception as e:
+                logger.error(f"Erro ao salvar temperatura no DynamoDB: {e}")
         return {"mensagem": "Dados recebidos com sucesso", "status": "OK"}
     except Exception as e:
         logger.error(f"Erro ao processar dados: {str(e)}")
@@ -658,21 +726,29 @@ def receber_temperatura(dados: DadosTemperatura):
 
 @app.get("/api/temperatura/ultima", tags=["Temperatura"])
 def obter_ultima():
-    if not dados_temperatura:
-        return {"mensagem": "Nenhum dado disponível", "dados": None}
-    
-    ultimo = dados_temperatura[-1]
+    if db_service:
+        ultimo = db_service.obter_ultima_temperatura()
+        if not ultimo:
+            return {"mensagem": "Nenhum dado disponível", "dados": None}
+    else:
+        if not dados_temperatura:
+            return {"mensagem": "Nenhum dado disponível", "dados": None}
+        ultimo = dados_temperatura[-1]
     logger.info(f"Retornando última leitura: {ultimo['temperatura']}°C")
     return {"mensagem": "Última leitura", "dados": ultimo}
 
 @app.get("/api/temperatura/todas", response_model=List[dict], tags=["Temperatura"])
 def obter_todas_temperaturas():
-    logger.info(f"Retornando {len(dados_temperatura)} leituras")
+    if db_service:
+        dados = db_service.obter_todas_temperaturas(limite=100)
+        logger.info(f"Retornando {len(dados)} leituras (DB)")
+        return dados
+    logger.info(f"Retornando {len(dados_temperatura)} leituras (mem)")
     return dados_temperatura
 
 @app.get("/api/temperatura/contador", tags=["Temperatura"])
 def obter_contador_dados():
-    contador = len(dados_temperatura)
+    contador = db_service.contar_temperaturas() if db_service else len(dados_temperatura)
     logger.info(f"Total de leituras: {contador}")
     return {"contador": contador, "mensagem": f"Total de {contador} leituras armazenadas"}
 
@@ -681,33 +757,46 @@ def obter_contador_dados():
 @app.get("/api/alertas", response_model=List[dict], tags=["Emergencia"])
 def obter_todos_alertas():
     """Retorna todos os alertas de emergência"""
-    logger.info(f"Retornando {len(alertas_emergencia)} alertas de emergência")
+    if db_service:
+        dados = db_service.obter_todos_alertas(limite=100)
+        logger.info(f"Retornando {len(dados)} alertas de emergência (DB)")
+        return dados
+    logger.info(f"Retornando {len(alertas_emergencia)} alertas de emergência (mem)")
     return alertas_emergencia
 
 @app.get("/api/alertas/ultimo", tags=["Emergencia"])
 def obter_ultimo_alerta():
     """Retorna o último alerta de emergência"""
-    if not alertas_emergencia:
-        return {"mensagem": "Nenhum alerta de emergência", "dados": None}
-    
-    ultimo = alertas_emergencia[-1]
+    if db_service:
+        ultimo = db_service.obter_ultimo_alerta()
+        if not ultimo:
+            return {"mensagem": "Nenhum alerta de emergência", "dados": None}
+    else:
+        if not alertas_emergencia:
+            return {"mensagem": "Nenhum alerta de emergência", "dados": None}
+        ultimo = alertas_emergencia[-1]
     logger.info(f"Retornando último alerta: {ultimo['tipo_alerta']}")
     return {"mensagem": "Último alerta", "dados": ultimo}
 
 @app.get("/api/alertas/contador", tags=["Emergencia"])
 def obter_contador_alertas():
     """Retorna o número total de alertas de emergência"""
-    contador = len(alertas_emergencia)
-    contador_criticos = len([a for a in alertas_emergencia if a['severidade'] == 'CRITICO'])
-    contador_altos = len([a for a in alertas_emergencia if a['severidade'] == 'ALTO'])
-    
-    logger.info(f"Total de alertas: {contador} (Críticos: {contador_criticos}, Altos: {contador_altos})")
+    if db_service:
+        cont = db_service.contar_alertas()
+        total = cont.get('total', 0)
+        crit = cont.get('CRITICO', 0)
+        alto = cont.get('ALTO', 0)
+    else:
+        total = len(alertas_emergencia)
+        crit = len([a for a in alertas_emergencia if a['severidade'] == 'CRITICO'])
+        alto = len([a for a in alertas_emergencia if a['severidade'] == 'ALTO'])
+    logger.info(f"Total de alertas: {total} (Críticos: {crit}, Altos: {alto})")
     return {
-        "total_alertas": contador,
-        "alertas_criticos": contador_criticos,
-        "alertas_altos": contador_altos,
-        "alertas_medios": contador - contador_criticos - contador_altos,
-        "mensagem": f"Total de {contador} alertas de emergência"
+        "total_alertas": total,
+        "alertas_criticos": crit,
+        "alertas_altos": alto,
+        "alertas_medios": total - crit - alto,
+        "mensagem": f"Total de {total} alertas de emergência"
     }
 
 @app.post("/api/alertas/limpar", tags=["Emergencia"])

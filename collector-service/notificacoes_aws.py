@@ -20,18 +20,18 @@ class NotificadorAWS:
             self.region = os.getenv('AWS_REGION', 'us-east-1')
             
             # Criar cliente SNS
+            # Usa credenciais padrão do ambiente/role. Se AWS_ACCESS_KEY_ID/SECRET estiverem no env,
+            # o boto3 as usará automaticamente; não passamos valores hardcoded.
             self.sns_client = boto3.client(
                 'sns',
-                region_name=self.region,
-                aws_access_key_id=os.getenv('xx'),
-                aws_secret_access_key=os.getenv('xx')
+                region_name=self.region
             )
             
             # Número de telefone para notificações
-            self.numero_telefone = os.getenv('TELEFONE_NOTIFICACAO', '+xx')
+            self.numero_telefone = os.getenv('TELEFONE_NOTIFICACAO')
             
             # Email para notificações
-            self.email_notificacao = os.getenv('EMAIL_NOTIFICACAO', 'xx')
+            self.email_notificacao = os.getenv('EMAIL_NOTIFICACAO')
             
             logger.info("Cliente AWS SNS configurado com sucesso")
             
@@ -81,44 +81,23 @@ Ação necessária: Verificar refrigerador imediatamente!
             return False
         
         try:
-            # Formatar mensagem HTML
-            mensagem_html = f"""
-            <html>
-            <body>
-                <h2 style="color: #e74c3c;">ALERTA IMMUNOTRACK</h2>
-                
-                <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
-                    <h3>Detalhes do Alerta:</h3>
-                    <p><strong>Tipo:</strong> {alerta['tipo_alerta']}</p>
-                    <p><strong>Sensor:</strong> {alerta['id_sensor']}</p>
-                    <p><strong>Temperatura:</strong> {alerta['temperatura']}°C</p>
-                    <p><strong>Severidade:</strong> {alerta['severidade']}</p>
-                    <p><strong>Mensagem:</strong> {alerta['mensagem']}</p>
-                    <p><strong>Horário:</strong> {alerta['timestamp']}</p>
-                </div>
-                
-                <div style="background: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #f39c12;">
-                    <strong>Ação Necessária:</strong> Verificar o refrigerador imediatamente!
-                </div>
-                
-                <p style="margin-top: 20px; color: #666;">
-                    Este é um alerta automático do sistema ImmunoTrack.
-                </p>
-            </body>
-            </html>
-            """
+            # Formatar mensagem texto (compatível com assinaturas por email do SNS)
+            mensagem_texto = (
+                "ALERTA IMMUNOTRACK\n\n"
+                f"Tipo: {alerta['tipo_alerta']}\n"
+                f"Sensor: {alerta['id_sensor']}\n"
+                f"Temperatura: {alerta['temperatura']}°C\n"
+                f"Severidade: {alerta['severidade']}\n"
+                f"Mensagem: {alerta['mensagem']}\n"
+                f"Horário: {alerta['timestamp']}\n\n"
+                "Ação necessária: Verificar o refrigerador imediatamente!"
+            )
             
             # Enviar email
             response = self.sns_client.publish(
                 TopicArn=self.get_topic_arn_email(),
-                Message=mensagem_html,
-                Subject=f"ImmunoTrack - {alerta['tipo_alerta']} - {alerta['severidade']}",
-                MessageAttributes={
-                    'content-type': {
-                        'DataType': 'String',
-                        'StringValue': 'text/html'
-                    }
-                }
+                Message=mensagem_texto,
+                Subject=f"ImmunoTrack - {alerta['tipo_alerta']} - {alerta['severidade']}"
             )
             
             logger.info(f"Email enviado com sucesso: {response['MessageId']}")
