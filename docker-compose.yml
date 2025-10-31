@@ -8,12 +8,18 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - AWS_REGION=us-east-1
+      - AWS_DYNAMODB_ENDPOINT=http://dynamodb:8000
+      - AWS_ACCESS_KEY_ID=local
+      - AWS_SECRET_ACCESS_KEY=local
+      - REPLICATION_LOCAL_ENABLED=false
       - EMAIL_NOTIFICACAO=icraftgamer@gmail.com
       - SNS_TOPIC_ARN_EMAIL=arn:aws:sns:us-east-1:985798502313:immunotrack-alerts
       - DEBUG=True
       - LOG_LEVEL=INFO
     networks:
       - immunotrack-network
+    depends_on:
+      - dynamodb
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/saude"]
       interval: 30s
@@ -21,18 +27,83 @@ services:
       retries: 3
       start_period: 5s
 
-  sensor-service:
+  # Segundo coletor para visualizar liderança lado a lado (porta 8002)
+  collector-service-b:
+    build: ./collector-service
+    ports:
+      - "8002:8000"
+    env_file:
+      - ./collector-service/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AWS_REGION=us-east-1
+      - AWS_DYNAMODB_ENDPOINT=http://dynamodb:8000
+      - AWS_ACCESS_KEY_ID=local
+      - AWS_SECRET_ACCESS_KEY=local
+      - REPLICATION_LOCAL_ENABLED=false
+      - EMAIL_NOTIFICACAO=icraftgamer@gmail.com
+      - SNS_TOPIC_ARN_EMAIL=arn:aws:sns:us-east-1:985798502313:immunotrack-alerts
+      - DEBUG=True
+      - LOG_LEVEL=INFO
+    networks:
+      - immunotrack-network
+    depends_on:
+      - dynamodb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/saude"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # Sensores fixos por sala
+  sensor-salaa:
     build: ./sensor-service
     environment:
       - COLLECTOR_URL=http://collector-service:8000
-      - SENSOR_ID=sensor-001
-      - INTERVAL=10
+      - SENSOR_ID=salaA-sensor01
+      - INTERVAL=3
       - PYTHONUNBUFFERED=1
     networks:
       - immunotrack-network
     depends_on:
       collector-service:
         condition: service_healthy
+
+  sensor-salab:
+    build: ./sensor-service
+    environment:
+      - COLLECTOR_URL=http://collector-service:8000
+      - SENSOR_ID=salaB-sensor02
+      - INTERVAL=3
+      - PYTHONUNBUFFERED=1
+    networks:
+      - immunotrack-network
+    depends_on:
+      collector-service:
+        condition: service_healthy
+
+  sensor-salac:
+    build: ./sensor-service
+    environment:
+      - COLLECTOR_URL=http://collector-service:8000
+      - SENSOR_ID=salaC-sensor03
+      - INTERVAL=3
+      - PYTHONUNBUFFERED=1
+    networks:
+      - immunotrack-network
+    depends_on:
+      collector-service:
+        condition: service_healthy
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    # A imagem já tem entrypoint 'java'; passamos os argumentos do DynamoDB Local
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb"]
+    ports:
+      - "8001:8000" # porta externa 8001 para acessar o console/CLI
+    networks:
+      - immunotrack-network
 
 networks:
   immunotrack-network:

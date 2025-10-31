@@ -20,23 +20,42 @@ class DynamoDBService:
 
             # MUDAR TUDO DAS REGIOES PARA TESTES, SALVO PARA NAO SE PERDER
             self.region = os.getenv('AWS_REGION', 'us-east-1')
+            self.endpoint_url = os.getenv('AWS_DYNAMODB_ENDPOINT')  # ex.: http://dynamodb:8000 para local
+            self.replication_enabled = os.getenv('REPLICATION_LOCAL_ENABLED', 'false').lower() == 'true'
             
-            self.dynamodb = boto3.resource(
-                'dynamodb',
-                region_name=self.region,
-                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-            )
+            # Conexão flexível: suporta AWS gerenciado e DynamoDB Local via endpoint_url
+            session_kwargs = {
+                'region_name': self.region
+            }
+            # Para ambiente AWS gerenciado, as credenciais podem vir do ambiente/role;
+            # para local com endpoint, não exigimos credenciais explícitas
+            access_key = os.getenv('AWS_ACCESS_KEY_ID')
+            secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+            if access_key and secret_key:
+                session_kwargs['aws_access_key_id'] = access_key
+                session_kwargs['aws_secret_access_key'] = secret_key
+
+            if self.endpoint_url:
+                self.dynamodb = boto3.resource('dynamodb', endpoint_url=self.endpoint_url, **session_kwargs)
+            else:
+                self.dynamodb = boto3.resource('dynamodb', **session_kwargs)
             
             # Nomes das tabelas
             self.temperaturas_table_name = 'immunotrack-temperaturas'
             self.alertas_table_name = 'immunotrack-alertas'
+            self.temperaturas_replica_table_name = f"{self.temperaturas_table_name}-replica"
+            self.alertas_replica_table_name = f"{self.alertas_table_name}-replica"
             
             # Referências das tabelas
             self.temperaturas_table = self.dynamodb.Table(self.temperaturas_table_name)
             self.alertas_table = self.dynamodb.Table(self.alertas_table_name)
+            self.temperaturas_replica_table = self.dynamodb.Table(self.temperaturas_replica_table_name) if self.replication_enabled else None
+            self.alertas_replica_table = self.dynamodb.Table(self.alertas_replica_table_name) if self.replication_enabled else None
             
-            logger.info(f"DynamoDB conectado na região {self.region}")
+            logger.info(f"DynamoDB conectado na região {self.region}{' (endpoint local)' if self.endpoint_url else ''}")
+
+            # Garante que as tabelas existam (útil para DynamoDB Local e primeira execução)
+            self._ensure_tables_exist()
             
         except NoCredentialsError:
             logger.error("Credenciais AWS não encontradas")
@@ -49,12 +68,44 @@ class DynamoDBService:
     
     def testar_conexao(self):
         try:
-            client = boto3.client('dynamodb', region_name=self.region)
+            client = boto3.client('dynamodb', region_name=self.region, endpoint_url=self.endpoint_url) if self.endpoint_url else boto3.client('dynamodb', region_name=self.region)
             response = client.list_tables()
             return True
         except Exception as e:
             logger.error(f"Erro ao testar conexão DynamoDB: {e}")
             return False
+
+    def _ensure_tables_exist(self) -> None:
+        try:
+            client = boto3.client('dynamodb', region_name=self.region, endpoint_url=self.endpoint_url) if self.endpoint_url else boto3.client('dynamodb', region_name=self.region)
+
+            def ensure_table(name: str):
+                try:
+                    client.describe_table(TableName=name)
+                except ClientError as ce:
+                    code = ce.response.get('Error', {}).get('Code')
+                    if code == 'ResourceNotFoundException':
+                        client.create_table(
+                            TableName=name,
+                            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}],
+                            KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+                            BillingMode='PAY_PER_REQUEST'
+                        )
+                        waiter = client.get_waiter('table_exists')
+                        waiter.wait(TableName=name)
+                        logger.info(f"Tabela criada: {name}")
+                    else:
+                        raise
+
+            ensure_table(self.temperaturas_table_name)
+            ensure_table(self.alertas_table_name)
+            if self.replication_enabled:
+                ensure_table(self.temperaturas_replica_table_name)
+                ensure_table(self.alertas_replica_table_name)
+
+        except Exception as e:
+            # Em ambientes com permissões restritas, apenas loga e segue em frente
+            logger.warning(f"Não foi possível garantir criação de tabelas automaticamente: {e}")
     
     def _converter_decimal(self, obj):
         if isinstance(obj, Decimal):
@@ -94,6 +145,14 @@ class DynamoDBService:
             
             self.temperaturas_table.put_item(Item=item)
             logger.info(f"Temperatura salva: {temperatura}°C do sensor {id_sensor}")
+            
+            # Write-through para réplica local (demonstração de replicação)
+            if self.replication_enabled and self.temperaturas_replica_table is not None:
+                try:
+                    self.temperaturas_replica_table.put_item(Item=item)
+                    logger.info("Temperatura replicada na tabela de réplica")
+                except Exception as repl_err:
+                    logger.warning(f"Falha ao replicar temperatura (write-through): {repl_err}")
             
             return self._converter_decimal(item)
             
@@ -187,6 +246,14 @@ class DynamoDBService:
             self.alertas_table.put_item(Item=item)
             logger.info(f"Alerta salvo: {tipo_alerta} - {severidade}")
             
+            # Write-through para réplica local (demonstração de replicação)
+            if self.replication_enabled and self.alertas_replica_table is not None:
+                try:
+                    self.alertas_replica_table.put_item(Item=item)
+                    logger.info("Alerta replicado na tabela de réplica")
+                except Exception as repl_err:
+                    logger.warning(f"Falha ao replicar alerta (write-through): {repl_err}")
+            
             return self._converter_decimal(item)
             
         except ClientError as e:
@@ -266,6 +333,38 @@ class DynamoDBService:
         except Exception as e:
             logger.error(f"Erro inesperado ao contar alertas: {e}")
             return {'total': 0}
+    
+    def marcar_alerta_resolvido(self, alerta_id: str) -> bool:
+        """Marca um alerta como resolvido atualizando o campo 'resolvido' para True."""
+        try:
+            # Buscar o alerta pelo ID
+            response = self.alertas_table.get_item(
+                Key={'id': alerta_id}
+            )
+            
+            if 'Item' not in response:
+                logger.warning(f"Alerta {alerta_id} não encontrado")
+                return False
+            
+            # Atualizar o alerta marcando como resolvido
+            self.alertas_table.update_item(
+                Key={'id': alerta_id},
+                UpdateExpression='SET resolvido = :resolvido, data_resolvido = :data_resolvido',
+                ExpressionAttributeValues={
+                    ':resolvido': True,
+                    ':data_resolvido': datetime.utcnow().isoformat()
+                }
+            )
+            
+            logger.info(f"Alerta {alerta_id} marcado como resolvido")
+            return True
+            
+        except ClientError as e:
+            logger.error(f"Erro ao marcar alerta como resolvido: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Erro inesperado ao marcar alerta como resolvido: {e}")
+            return False
 
     # =====================
     # Coordenação distribuída (eleição/locks)

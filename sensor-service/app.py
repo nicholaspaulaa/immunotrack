@@ -95,7 +95,7 @@ class SensorTemperatura:
             time.sleep(self.intervalo)
 
 if __name__ == "__main__":
-    ID_SENSOR = "sensor-001"
+    ID_SENSOR = os.getenv("SENSOR_ID", "sensor-001")
     URL_COLETOR = os.getenv("COLLECTOR_URL", "http://collector-service:8000")
     INTERVALO = int(os.getenv("INTERVAL", "10"))
     
