@@ -45,16 +45,43 @@ class SensorTemperatura:
         return round(random.uniform(2.0, 8.0), 2)
     
     def verificar_saude_coletor(self) -> bool:
-        try:
-            response = requests.get(f"{self.url_coletor}/saude", timeout=5)
-            if response.status_code == 200:
-                dados_saude = response.json()
-                logger.info(f"Status do coletor: {dados_saude['status']}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Erro ao verificar saúde do coletor: {e}")
-            return False
+        """Verifica saúde do coletor com retry automático"""
+        max_tentativas = 5
+        tentativa = 0
+        
+        while tentativa < max_tentativas:
+            try:
+                response = requests.get(f"{self.url_coletor}/saude", timeout=10)
+                if response.status_code == 200:
+                    dados_saude = response.json()
+                    logger.info(f"Status do coletor: {dados_saude['status']}")
+                    return True
+                else:
+                    logger.warning(f"Coletor respondeu com código {response.status_code}")
+                    tentativa += 1
+                    if tentativa < max_tentativas:
+                        time.sleep(3)
+            except requests.exceptions.Timeout:
+                tentativa += 1
+                if tentativa < max_tentativas:
+                    logger.warning(f"Timeout ao conectar (tentativa {tentativa}/{max_tentativas}) - aguardando...")
+                    time.sleep(5)
+                else:
+                    logger.error(f"Timeout após {max_tentativas} tentativas")
+            except requests.exceptions.ConnectionError as e:
+                tentativa += 1
+                if tentativa < max_tentativas:
+                    logger.warning(f"Erro de conexão (tentativa {tentativa}/{max_tentativas}): {e} - aguardando...")
+                    time.sleep(5)
+                else:
+                    logger.error(f"Erro de conexão após {max_tentativas} tentativas: {e}")
+            except Exception as e:
+                logger.error(f"Erro ao verificar saúde do coletor: {e}")
+                tentativa += 1
+                if tentativa < max_tentativas:
+                    time.sleep(3)
+        
+        return False
     
     def enviar_temperatura(self) -> bool:
         temperatura = self.gerar_temperatura()
@@ -126,12 +153,15 @@ class SensorTemperatura:
         logger.info(f"Iniciando sensor {self.id_sensor}")
         logger.info(f"Conectando com coletor: {self.url_coletor}")
         
+        # Tentar conectar com retry automático
         if not self.verificar_saude_coletor():
-            logger.error("Coletor não está disponível")
-            return
+            logger.error("Coletor não está disponível após várias tentativas")
+            logger.info("Sensor continuará tentando enviar dados mesmo sem confirmação inicial...")
+        else:
+            logger.info(f"Coletor conectado! Enviando dados a cada {self.intervalo} segundos")
         
-        logger.info(f"Coletor conectado! Enviando dados a cada {self.intervalo} segundos")
-        
+        # Continuar mesmo se não conseguir verificar saúde inicialmente
+        # O próprio envio tentará reconectar
         while True:
             self.executar_com_tentativas()
             time.sleep(self.intervalo)

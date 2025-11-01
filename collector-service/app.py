@@ -9,12 +9,14 @@ import os
 from dotenv import load_dotenv
 import asyncio
 import socket
+import concurrent.futures
 
 from dynamodb_basic import DynamoDBService
 from notificacoes_aws import notificar_alerta_critico
 from service_discovery import ServiceDiscovery, initialize_service_discovery
 from sqs_client import SQSClient, SQSMessageHandler, initialize_sqs_client
 from mqtt_subscriber import MQTTCollectorSubscriber
+from botocore.exceptions import NoCredentialsError
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
@@ -89,7 +91,24 @@ async def _loop_eleicao_lider():
                         for alerta_pendente in alertas_pendentes:
                             try:
                                 alerta_id = alerta_pendente.get('id') or alerta_pendente.get('id_alerta')
+                                
+                                # Pular se for o item de líder (não é um alerta real)
+                                if alerta_id and alerta_id.startswith('leader#'):
+                                    continue
+                                
                                 if alerta_id and db_service.marcar_alerta_notificado_uma_vez(alerta_id):
+                                    # Garantir que alerta tem todos os campos necessários
+                                    if 'severidade' not in alerta_pendente:
+                                        alerta_pendente['severidade'] = alerta_pendente.get('tipo_alerta', 'MEDIO')
+                                    if 'temperatura' not in alerta_pendente:
+                                        alerta_pendente['temperatura'] = alerta_pendente.get('temperatura', 0.0)
+                                    if 'id_sensor' not in alerta_pendente:
+                                        alerta_pendente['id_sensor'] = alerta_pendente.get('sensor_id', 'desconhecido')
+                                    if 'mensagem' not in alerta_pendente:
+                                        alerta_pendente['mensagem'] = alerta_pendente.get('mensagem', f"Alerta {alerta_pendente.get('tipo_alerta', '')} detectado")
+                                    if 'timestamp' not in alerta_pendente:
+                                        alerta_pendente['timestamp'] = alerta_pendente.get('data_criacao', alerta_pendente.get('timestamp', datetime.now(timezone(timedelta(hours=-3))).isoformat()))
+                                    
                                     notificar_alerta_aws(alerta_pendente)
                                     logger.info(f"[LIDER] Processou notificação pendente {alerta_id} (prioridade: {alerta_pendente.get('severidade', 'N/A')})")
                             except Exception as e:
@@ -102,11 +121,19 @@ async def _loop_eleicao_lider():
 def _processar_mensagem_mqtt(topic: str, payload: dict):
     """Processa mensagens recebidas via MQTT"""
     try:
+        logger.debug(f"[MQTT] Recebida mensagem no tópico: {topic}, payload: {payload}")
+        
         # Extrair tipo da mensagem do tópico ou payload
         if 'temperatura' in topic:
             sensor_id = payload.get('sensor_id')
             temperatura = float(payload.get('temperatura', 0))
             timestamp = payload.get('timestamp', datetime.now(timezone(timedelta(hours=-3))).isoformat())
+            
+            if not sensor_id:
+                logger.error(f"[MQTT] sensor_id não encontrado no payload: {payload}")
+                return
+            
+            logger.info(f"[MQTT] Processando temperatura do sensor {sensor_id}: {temperatura}°C")
             
             # Criar objeto DadosTemperatura
             dados = DadosTemperatura(
@@ -117,13 +144,17 @@ def _processar_mensagem_mqtt(topic: str, payload: dict):
             
             # Processar como se fosse recebido via HTTP
             receber_temperatura(dados)
-            logger.info(f"[MQTT] Processada temperatura do sensor {sensor_id} via MQTT")
+            
+            # Verificar se foi salvo em memória
+            logger.info(f"[MQTT] Processada temperatura do sensor {sensor_id} via MQTT (total em memória: {len(dados_temperatura)})")
             
         elif 'alerta' in topic:
             logger.warning(f"[MQTT] Alerta recebido via MQTT: {payload.get('mensagem', 'N/A')}")
+        else:
+            logger.warning(f"[MQTT] Tópico desconhecido: {topic}")
             
     except Exception as e:
-        logger.error(f"Erro ao processar mensagem MQTT: {e}")
+        logger.error(f"Erro ao processar mensagem MQTT: {e}", exc_info=True)
 
 async def _processar_mensagens_sqs(message_body: dict) -> bool:
     """Processa mensagens recebidas do SQS"""
@@ -167,47 +198,161 @@ async def _processar_mensagens_sqs(message_body: dict) -> bool:
 async def on_startup():
     global db_service, service_discovery, sqs_client, sqs_handler, mqtt_subscriber
     
-    # Inicializar DynamoDB
-    db_service = DynamoDBService()
+    # IMPORTANTE: Todas as inicializações SÍNCRONAS devem rodar em threads
+    # para não bloquear o event loop do FastAPI
     
-    # Inicializar Service Discovery
-    try:
-        service_discovery = initialize_service_discovery()
-        if service_discovery:
-            logger.info("[SERVICE_DISCOVERY] Inicializado")
-    except Exception as e:
-        logger.warning(f"[SERVICE_DISCOVERY] Não inicializado: {e}")
-    
-    # Inicializar SQS Client
-    try:
-        sqs_client = initialize_sqs_client()
-        if sqs_client:
-            logger.info("[SQS] Cliente inicializado")
-            # Criar handler para processar mensagens
-            sqs_handler = SQSMessageHandler(sqs_client, _processar_mensagens_sqs)
-            # Iniciar processamento assíncrono de mensagens
-            asyncio.create_task(sqs_handler.start_processing())
-            logger.info("[SQS] Handler iniciado")
-    except Exception as e:
-        logger.warning(f"[SQS] Não inicializado: {e}")
-    
-    # Inicializar MQTT Subscriber
-    use_mqtt = os.getenv('USE_MQTT', 'false').lower() == 'true'
-    if use_mqtt:
+    def init_dynamodb_sync():
+        """Inicializa DynamoDB em thread separada (não bloqueia event loop)"""
+        global db_service
         try:
-            mqtt_subscriber = MQTTCollectorSubscriber(
-                callback_function=_processar_mensagem_mqtt
-            )
-            if mqtt_subscriber.connect():
-                logger.info("[MQTT] Subscriber conectado e pronto")
-            else:
-                logger.warning("[MQTT] Falha ao conectar subscriber")
-                mqtt_subscriber = None
+            db_service = DynamoDBService()
+            logger.info("[DYNAMODB] Cliente inicializado")
+            
+            # Criar tabelas em thread separada depois
+            def criar_tabelas_thread():
+                try:
+                    import time
+                    time.sleep(2)  # Delay antes de criar
+                    if db_service and db_service.dynamodb:
+                        db_service._ensure_tables_exist()
+                        logger.info("[DYNAMODB] Tabelas verificadas/criadas")
+                except Exception as e:
+                    logger.warning(f"[DYNAMODB] Erro ao criar tabelas: {e}")
+            
+            if db_service and db_service.dynamodb:
+                import threading
+                threading.Thread(target=criar_tabelas_thread, daemon=True).start()
         except Exception as e:
-            logger.warning(f"[MQTT] Não inicializado: {e}")
+            logger.warning(f"[DYNAMODB] Erro ao inicializar: {e}")
+            db_service = None
     
-    # Iniciar loop de eleição de líder
-    asyncio.create_task(_loop_eleicao_lider())
+    def init_service_discovery_sync():
+        """Inicializa Service Discovery em thread separada"""
+        global service_discovery
+        try:
+            service_discovery = initialize_service_discovery()
+            if service_discovery:
+                logger.info("[SERVICE_DISCOVERY] Cliente inicializado")
+                
+                # Registrar Route 53 em thread separada depois
+                def registrar_thread():
+                    try:
+                        import time
+                        time.sleep(3)  # Delay antes de registrar
+                        if service_discovery and os.getenv('SERVICE_DISCOVERY_AUTO_REGISTER', 'false').lower() == 'true':
+                            service_discovery.register_service()
+                            logger.info("[SERVICE_DISCOVERY] Registro concluído")
+                    except Exception as e:
+                        logger.warning(f"[SERVICE_DISCOVERY] Erro ao registrar: {e}")
+                
+                import threading
+                threading.Thread(target=registrar_thread, daemon=True).start()
+        except Exception as e:
+            logger.warning(f"[SERVICE_DISCOVERY] Não inicializado: {e}")
+    
+    def init_sqs_sync():
+        """Inicializa SQS em thread separada"""
+        global sqs_client, sqs_handler
+        try:
+            sqs_client = initialize_sqs_client()
+            if sqs_client:
+                logger.info("[SQS] Cliente inicializado")
+                sqs_handler = SQSMessageHandler(sqs_client, _processar_mensagens_sqs)
+                
+                # Iniciar handler SQS no event loop principal (não pode ser thread)
+                # Usar call_soon para executar quando o loop estiver pronto
+                def start_sqs_handler():
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(sqs_handler.start_processing())
+                        )
+                        logger.info("[SQS] Handler iniciado")
+                    except Exception as e:
+                        logger.warning(f"[SQS] Erro ao iniciar handler: {e}")
+                
+                # Aguardar um pouco e então iniciar no loop principal
+                import threading
+                import time
+                def delayed_start():
+                    time.sleep(1)  # Aguardar loop estar pronto
+                    start_sqs_handler()
+                
+                threading.Thread(target=delayed_start, daemon=True).start()
+        except Exception as e:
+            logger.warning(f"[SQS] Não inicializado: {e}")
+    
+    def init_mqtt_sync():
+        """Inicializa MQTT em thread separada com retry"""
+        global mqtt_subscriber
+        use_mqtt = os.getenv('USE_MQTT', 'false').lower() == 'true'
+        if use_mqtt:
+            import time
+            broker_host = os.getenv('MQTT_BROKER_HOST', 'mosquitto')
+            
+            # Aguardar um pouco antes de tentar conectar (mosquitto pode estar iniciando)
+            logger.info(f"[MQTT] Aguardando 3 segundos antes de conectar ao broker {broker_host}...")
+            time.sleep(3)
+            
+            max_tentativas = 10
+            tentativa = 0
+            
+            while tentativa < max_tentativas:
+                try:
+                    logger.info(f"[MQTT] Tentativa {tentativa + 1}/{max_tentativas} de conexão ao broker {broker_host}")
+                    mqtt_subscriber = MQTTCollectorSubscriber(
+                        callback_function=_processar_mensagem_mqtt
+                    )
+                    if mqtt_subscriber.connect():
+                        logger.info("[MQTT] Subscriber conectado e pronto")
+                        return
+                    else:
+                        tentativa += 1
+                        if tentativa < max_tentativas:
+                            logger.warning(f"[MQTT] Falha ao conectar, tentando novamente em 3s... ({tentativa}/{max_tentativas})")
+                            time.sleep(3)
+                        else:
+                            logger.error("[MQTT] Falha ao conectar após todas as tentativas")
+                            mqtt_subscriber = None
+                except Exception as e:
+                    tentativa += 1
+                    if tentativa < max_tentativas:
+                        logger.warning(f"[MQTT] Erro ao conectar (tentativa {tentativa}/{max_tentativas}): {e} - aguardando 3s...")
+                        time.sleep(3)
+                    else:
+                        logger.error(f"[MQTT] Erro após todas as tentativas: {e}")
+                        mqtt_subscriber = None
+    
+    # Executar todas as inicializações SÍNCRONAS em threads separadas
+    # Isso garante que NÃO bloqueiem o event loop do FastAPI
+    import threading
+    
+    threading.Thread(target=init_dynamodb_sync, daemon=True).start()
+    threading.Thread(target=init_service_discovery_sync, daemon=True).start()
+    threading.Thread(target=init_sqs_sync, daemon=True).start()
+    threading.Thread(target=init_mqtt_sync, daemon=True).start()
+    
+    # Iniciar SQS handler e loop de eleição de líder no event loop (não em thread)
+    async def init_async_services():
+        """Inicializa serviços que precisam do event loop"""
+        global sqs_handler
+        try:
+            # Aguardar um pouco para SQS client estar pronto
+            await asyncio.sleep(0.5)
+            if sqs_handler:
+                asyncio.create_task(sqs_handler.start_processing())
+                logger.info("[SQS] Handler iniciado no event loop")
+        except Exception as e:
+            logger.warning(f"[SQS] Erro ao iniciar handler: {e}")
+        
+        # Loop de eleição de líder - em background (async)
+        asyncio.create_task(_loop_eleicao_lider())
+    
+    # Iniciar serviços assíncronos
+    asyncio.create_task(init_async_services())
+    
+    # Startup IMEDIATO - não aguarda nada!
+    logger.info("[STARTUP] FastAPI iniciado - serviços em background (threads)")
 
 def notificar_alerta_aws(alerta_dict):
     """Envia notificação via AWS SNS para alertas críticos"""
@@ -217,6 +362,19 @@ def notificar_alerta_aws(alerta_dict):
         if not topic_arn:
             logger.warning("SNS_TOPIC_ARN_EMAIL não configurado - notificações não serão enviadas")
             return False
+
+        # Garantir que alerta tem todos os campos necessários
+        if 'severidade' not in alerta_dict:
+            alerta_dict['severidade'] = alerta_dict.get('tipo_alerta', 'MEDIO')
+        
+        if 'tipo_alerta' not in alerta_dict:
+            alerta_dict['tipo_alerta'] = alerta_dict.get('severidade', 'ALERTA')
+        
+        if 'id_sensor' not in alerta_dict:
+            alerta_dict['id_sensor'] = alerta_dict.get('sensor_id', 'desconhecido')
+        
+        if 'mensagem' not in alerta_dict:
+            alerta_dict['mensagem'] = f"Alerta {alerta_dict.get('tipo_alerta', '')} detectado"
 
         notificar_alerta_critico(alerta_dict)
         logger.info("Notificação AWS enviada com sucesso")
@@ -342,7 +500,16 @@ def pagina_saude():
     agora_brasilia = datetime.now(fuso_brasilia)
     
     # Buscar dados dos sensores
-    dados_origem = (db_service.obter_todas_temperaturas(limite=100) if db_service else dados_temperatura)
+    # Tentar DynamoDB, usar memória como fallback se vazio
+    if db_service:
+        try:
+            dados_db = db_service.obter_todas_temperaturas(limite=100)
+            dados_origem = dados_db if dados_db else dados_temperatura
+        except Exception as e:
+            logger.warning(f"Erro ao buscar do DB: {e}, usando memória")
+            dados_origem = dados_temperatura
+    else:
+        dados_origem = dados_temperatura
     
     # Agrupar últimas leituras por sensor
     leituras = {}
@@ -627,7 +794,16 @@ def painel_visual(request: Request):
     ultimo = dados_temperatura[-1] if dados_temperatura else None
     
     # Calcular estatísticas - buscar mais dados para garantir que temos os últimos de cada sensor
-    dados_origem = (db_service.obter_todas_temperaturas(limite=500) if db_service else dados_temperatura)
+    # Tentar DynamoDB, usar memória como fallback se vazio
+    if db_service:
+        try:
+            dados_db = db_service.obter_todas_temperaturas(limite=500)
+            dados_origem = dados_db if dados_db else dados_temperatura
+        except Exception as e:
+            logger.warning(f"Erro ao buscar do DB: {e}, usando memória")
+            dados_origem = dados_temperatura
+    else:
+        dados_origem = dados_temperatura
     if dados_origem:
         temperaturas = [d['temperatura'] for d in dados_origem]
         temp_media = round(sum(temperaturas) / len(temperaturas), 2)
@@ -1664,15 +1840,24 @@ def painel_visual(request: Request):
 
 @app.get("/saude", response_model=RespostaSaude, tags=["Saude"])
 def verificar_saude():
+    """Endpoint de health check - responde IMEDIATAMENTE sem aguardar DynamoDB"""
     # Horário GMT-3 (Brasília)
     fuso_brasilia = timezone(timedelta(hours=-3))
     agora_brasilia = datetime.now(fuso_brasilia)
+    
+    # Usar APENAS contador em memória para resposta instantânea
+    # DynamoDB pode estar lento e fazer health check falhar
+    # Não tentar acessar DynamoDB aqui - isso é só health check
+    contador_dados = len(dados_temperatura)
+    
+    # NÃO tentar DynamoDB no health check - pode demorar e causar timeout
+    # Health check deve ser ultra-rápido (< 500ms)
     
     return RespostaSaude(
         status="saudavel",
         timestamp=agora_brasilia.isoformat(),
         servico=("servico-coletor-lider" if is_lider_atual else "servico-coletor-seguidor"),
-        contador_dados=(db_service.contar_temperaturas() if db_service else len(dados_temperatura))
+        contador_dados=contador_dados
     )
 
 @app.post("/api/temperatura", tags=["Temperatura"])
@@ -1683,6 +1868,11 @@ def receber_temperatura(dados: DadosTemperatura):
     """
     try:
         logger.info(f"Recebido dados do sensor {dados.id_sensor}: {dados.temperatura}°C")
+        
+        # SEMPRE salvar em memória primeiro (para consultas rápidas)
+        # Isso garante que os dados estejam disponíveis mesmo se SQS ou DynamoDB falharem
+        dados_temperatura.append(dados.dict())
+        logger.info(f"Dados salvos em memória (total: {len(dados_temperatura)}) - Sensor: {dados.id_sensor}, Temp: {dados.temperatura}°C")
         
         # Opcionalmente enviar para SQS para processamento assíncrono
         use_sqs = os.getenv('USE_SQS_FOR_TEMPERATURE', 'false').lower() == 'true'
@@ -1706,15 +1896,10 @@ def receber_temperatura(dados: DadosTemperatura):
             
             if message_id:
                 logger.info(f"[SQS] Mensagem enviada para fila {priority} (ID: {message_id})")
-                return {
-                    "mensagem": "Dados recebidos e enfileirados",
-                    "status": "ENQUEUED",
-                    "message_id": message_id,
-                    "queue_priority": priority
-                }
+                # Não retornar aqui - continuar processando normalmente para salvar no DynamoDB
         
         # Processamento síncrono (comportamento padrão)
-        dados_temperatura.append(dados.dict())
+        # (dados já foram salvos em memória acima)
         
         # Persistir no DynamoDB
         if db_service:
@@ -1780,10 +1965,22 @@ def obter_ultima():
 
 @app.get("/api/temperatura/todas", response_model=List[dict], tags=["Temperatura"])
 def obter_todas_temperaturas():
+    # Tentar DynamoDB primeiro, mas usar fallback para memória se vazio
     if db_service:
-        dados = db_service.obter_todas_temperaturas(limite=100)
-        logger.info(f"Retornando {len(dados)} leituras (DB)")
-        return dados
+        try:
+            dados = db_service.obter_todas_temperaturas(limite=100)
+            # Se DynamoDB retornar vazio, usar dados em memória como fallback
+            if dados:
+                logger.info(f"Retornando {len(dados)} leituras (DB)")
+                return dados
+            else:
+                # Fallback para memória se DB está vazio
+                logger.info(f"DB vazio, usando {len(dados_temperatura)} leituras (mem)")
+                return dados_temperatura
+        except Exception as e:
+            logger.warning(f"Erro ao buscar do DB: {e}, usando memória")
+            return dados_temperatura
+    
     logger.info(f"Retornando {len(dados_temperatura)} leituras (mem)")
     return dados_temperatura
 
@@ -1918,7 +2115,16 @@ def obter_dados_graficos():
     """Retorna os dados necessários para atualizar os gráficos"""
     try:
         # Buscar dados
-        dados_origem = (db_service.obter_todas_temperaturas(limite=500) if db_service else dados_temperatura)
+        # Tentar DynamoDB, usar memória como fallback se vazio
+        if db_service:
+            try:
+                dados_db = db_service.obter_todas_temperaturas(limite=500)
+                dados_origem = dados_db if dados_db else dados_temperatura
+            except Exception as e:
+                logger.warning(f"Erro ao buscar do DB: {e}, usando memória")
+                dados_origem = dados_temperatura
+        else:
+            dados_origem = dados_temperatura
         
         # Buscar alertas não resolvidos
         alertas_origem = (db_service.obter_todos_alertas(limite=200) if db_service else alertas_emergencia)

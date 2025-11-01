@@ -94,14 +94,22 @@ Ação necessária: Verificar refrigerador imediatamente!
             return False
         
         try:
+            # Garantir que todos os campos existem
+            tipo_alerta = alerta.get('tipo_alerta', 'ALERTA')
+            id_sensor = alerta.get('id_sensor', alerta.get('sensor_id', 'desconhecido'))
+            temperatura = alerta.get('temperatura', 'N/A')
+            severidade = alerta.get('severidade', 'MEDIO')
+            mensagem = alerta.get('mensagem', f"Alerta {tipo_alerta} detectado")
+            timestamp = alerta.get('timestamp', alerta.get('data_criacao', 'N/A'))
+            
             mensagem_texto = (
                 "ALERTA IMMUNOTRACK\n\n"
-                f"Tipo: {alerta['tipo_alerta']}\n"
-                f"Sensor: {alerta['id_sensor']}\n"
-                f"Temperatura: {alerta['temperatura']}°C\n"
-                f"Severidade: {alerta['severidade']}\n"
-                f"Mensagem: {alerta['mensagem']}\n"
-                f"Horário: {alerta['timestamp']}\n\n"
+                f"Tipo: {tipo_alerta}\n"
+                f"Sensor: {id_sensor}\n"
+                f"Temperatura: {temperatura}°C\n"
+                f"Severidade: {severidade}\n"
+                f"Mensagem: {mensagem}\n"
+                f"Horário: {timestamp}\n\n"
                 "Ação necessária: Verificar o refrigerador imediatamente!"
             )
             
@@ -109,7 +117,7 @@ Ação necessária: Verificar refrigerador imediatamente!
             response = self.sns_client.publish(
                 TopicArn=self.get_topic_arn_email(),
                 Message=mensagem_texto,
-                Subject=f"ImmunoTrack - {alerta['tipo_alerta']} - {alerta['severidade']}"
+                Subject=f"ImmunoTrack - {tipo_alerta} - {severidade}"
             )
             
             logger.info(f"Email enviado com sucesso: {response['MessageId']}")

@@ -86,14 +86,26 @@ class MQTTCollectorSubscriber:
             self.client.on_message = self._on_message
             self.client.on_subscribe = self._on_subscribe
             
-            # Conectar ao broker
+            logger.info(f"[MQTT] Tentando conectar ao broker {self.broker_host}:{self.broker_port}")
+            
+            # Conectar ao broker com timeout
             self.client.connect(self.broker_host, self.broker_port, keepalive=60)
             self.client.loop_start()
             
-            return True
+            # Aguardar um pouco para verificar se conectou
+            import time
+            time.sleep(1)  # Aguardar callback de conexão
+            
+            if self.connected:
+                logger.info(f"[MQTT] Conectado com sucesso ao broker {self.broker_host}:{self.broker_port}")
+                return True
+            else:
+                logger.warning(f"[MQTT] Loop iniciado, mas ainda não confirmado como conectado")
+                # Ainda retornar True, pois o loop_start() iniciou - a conexão pode ser assíncrona
+                return True
             
         except Exception as e:
-            logger.error(f"Erro ao conectar ao broker MQTT: {e}")
+            logger.error(f"Erro ao conectar ao broker MQTT {self.broker_host}:{self.broker_port}: {e}")
             return False
     
     def disconnect(self):

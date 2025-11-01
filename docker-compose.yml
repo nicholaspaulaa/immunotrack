@@ -28,15 +28,15 @@ services:
       - MQTT_BROKER_PORT=${MQTT_BROKER_PORT:-1883}
     networks:
       - immunotrack-network
-    # depends_on condicional baseado em variáveis de ambiente
-    # Se AWS_DYNAMODB_ENDPOINT não estiver definido, não depende de dynamodb local
-    depends_on: []
+    depends_on:
+      mosquitto:
+        condition: service_started
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/saude"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "curl", "-f", "--max-time", "5", "http://localhost:80/saude"]
+      interval: 10s
+      timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 20s
 
   # Segundo coletor para visualizar liderança lado a lado (porta 8080)
   collector-service-b:

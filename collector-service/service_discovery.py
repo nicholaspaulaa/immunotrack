@@ -49,8 +49,8 @@ class ServiceDiscovery:
                 pass
             
             # Método 2: Via hostname (fallback para local/Docker)
-            hostname = socket.gethostname()
             try:
+                hostname = socket.gethostname()
                 ip = socket.gethostbyname(hostname)
                 if not ip.startswith('127.'):
                     return ip
@@ -58,7 +58,6 @@ class ServiceDiscovery:
                 pass
             
             # Método 3: Via interfaces de rede
-            import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
                 s.connect(('8.8.8.8', 80))
@@ -234,13 +233,12 @@ service_discovery = None
 
 
 def initialize_service_discovery() -> Optional[ServiceDiscovery]:
-    """Inicializa o Service Discovery globalmente"""
+    """Inicializa o Service Discovery globalmente (sem auto-registro aqui)"""
     global service_discovery
     try:
         service_discovery = ServiceDiscovery()
-        # Auto-registro
-        if os.getenv('SERVICE_DISCOVERY_AUTO_REGISTER', 'false').lower() == 'true':
-            service_discovery.register_service()
+        # NÃO fazer auto-registro aqui - será feito de forma assíncrona no app.py
+        # Isso evita bloquear a inicialização
         return service_discovery
     except Exception as e:
         logger.warning(f"Service Discovery não inicializado: {e}")

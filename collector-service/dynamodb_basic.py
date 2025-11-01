@@ -17,7 +17,6 @@ class DynamoDBService:
     
     def __init__(self):
         try:
-
             self.region = os.getenv('AWS_REGION', 'us-east-1')
             self.endpoint_url = os.getenv('AWS_DYNAMODB_ENDPOINT')
             self.replication_enabled = os.getenv('REPLICATION_LOCAL_ENABLED', 'false').lower() == 'true'
@@ -31,10 +30,16 @@ class DynamoDBService:
                 session_kwargs['aws_access_key_id'] = access_key
                 session_kwargs['aws_secret_access_key'] = secret_key
 
-            if self.endpoint_url:
-                self.dynamodb = boto3.resource('dynamodb', endpoint_url=self.endpoint_url, **session_kwargs)
-            else:
-                self.dynamodb = boto3.resource('dynamodb', **session_kwargs)
+            # Criar cliente/resource de forma não-bloqueante
+            # Usar timeout curto e não aguardar conexão completa
+            try:
+                if self.endpoint_url:
+                    self.dynamodb = boto3.resource('dynamodb', endpoint_url=self.endpoint_url, **session_kwargs)
+                else:
+                    self.dynamodb = boto3.resource('dynamodb', **session_kwargs)
+            except Exception as connect_err:
+                logger.warning(f"Erro ao criar cliente DynamoDB: {connect_err}")
+                raise
             
             # Nomes das tabelas
             self.temperaturas_table_name = 'immunotrack-temperaturas'
@@ -42,23 +47,38 @@ class DynamoDBService:
             self.temperaturas_replica_table_name = f"{self.temperaturas_table_name}-replica"
             self.alertas_replica_table_name = f"{self.alertas_table_name}-replica"
             
-            # Referências das tabelas
-            self.temperaturas_table = self.dynamodb.Table(self.temperaturas_table_name)
-            self.alertas_table = self.dynamodb.Table(self.alertas_table_name)
-            self.temperaturas_replica_table = self.dynamodb.Table(self.temperaturas_replica_table_name) if self.replication_enabled else None
-            self.alertas_replica_table = self.dynamodb.Table(self.alertas_replica_table_name) if self.replication_enabled else None
+            # Referências das tabelas (lazy - não fazem conexão ainda)
+            # Isso acelera muito a inicialização
+            self.temperaturas_table = None
+            self.alertas_table = None
+            self.temperaturas_replica_table = None
+            self.alertas_replica_table = None
             
-            logger.info(f"DynamoDB conectado na região {self.region}{' (endpoint local)' if self.endpoint_url else ''}")
-
-            # Garante que as tabelas existam
-            self._ensure_tables_exist()
+            logger.info(f"DynamoDB cliente criado (região: {self.region}{' - endpoint local' if self.endpoint_url else ''})")
             
         except NoCredentialsError:
-            logger.error("Credenciais AWS não encontradas")
-            raise
+            logger.warning("Credenciais AWS não encontradas - DynamoDB desabilitado")
+            self.dynamodb = None
+            # Não levantar exceção - continuar sem DynamoDB
         except Exception as e:
-            logger.error(f"Erro ao conectar DynamoDB: {e}")
-            raise
+            logger.warning(f"Erro ao inicializar DynamoDB: {e} - continuando sem DynamoDB")
+            self.dynamodb = None
+            # Não levantar exceção - permitir que a aplicação continue
+    
+    def _get_tables(self):
+        """Inicializa referências das tabelas lazy (chamado quando necessário)"""
+        if not self.dynamodb:
+            return
+        
+        if self.temperaturas_table is None:
+            self.temperaturas_table = self.dynamodb.Table(self.temperaturas_table_name)
+        if self.alertas_table is None:
+            self.alertas_table = self.dynamodb.Table(self.alertas_table_name)
+        if self.replication_enabled:
+            if self.temperaturas_replica_table is None:
+                self.temperaturas_replica_table = self.dynamodb.Table(self.temperaturas_replica_table_name)
+            if self.alertas_replica_table is None:
+                self.alertas_replica_table = self.dynamodb.Table(self.alertas_replica_table_name)
 
     def testar_conexao(self):
         try:
@@ -70,35 +90,50 @@ class DynamoDBService:
             return False
 
     def _ensure_tables_exist(self) -> None:
+        """Garante que as tabelas existam, mas não trava se houver problemas"""
         try:
+            # Criar tabelas de forma não-bloqueante com timeout
             client = boto3.client('dynamodb', region_name=self.region, endpoint_url=self.endpoint_url) if self.endpoint_url else boto3.client('dynamodb', region_name=self.region)
 
             def ensure_table(name: str):
                 try:
+                    # Verificar se tabela existe (rápido - timeout curto)
                     client.describe_table(TableName=name)
+                    logger.debug(f"Tabela {name} já existe")
                 except ClientError as ce:
                     code = ce.response.get('Error', {}).get('Code')
                     if code == 'ResourceNotFoundException':
-                        client.create_table(
-                            TableName=name,
-                            AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}],
-                            KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
-                            BillingMode='PAY_PER_REQUEST'
-                        )
-                        waiter = client.get_waiter('table_exists')
-                        waiter.wait(TableName=name)
-                        logger.info(f"Tabela criada: {name}")
+                        try:
+                            logger.info(f"Criando tabela {name} em background...")
+                            # Criar tabela sem aguardar
+                            client.create_table(
+                                TableName=name,
+                                AttributeDefinitions=[{'AttributeName': 'id', 'AttributeType': 'S'}],
+                                KeySchema=[{'AttributeName': 'id', 'KeyType': 'HASH'}],
+                                BillingMode='PAY_PER_REQUEST'
+                            )
+                            logger.info(f"Tabela {name} em criação (não aguardando - será usada quando pronta)")
+                            # NÃO aguardar waiter - deixa criar em background
+                            # A tabela será usada quando estiver pronta
+                        except Exception as create_err:
+                            logger.warning(f"Erro ao criar tabela {name}: {create_err}")
+                            # Não bloquear - continuar mesmo se não criar agora
                     else:
-                        raise
+                        logger.debug(f"Erro ao verificar tabela {name}: {ce}")
+                        # Não bloquear por erros de permissão ou outros
 
+            # Criar tabelas principais (não bloquear se falhar)
             ensure_table(self.temperaturas_table_name)
             ensure_table(self.alertas_table_name)
+            
+            # Criar tabelas de réplica se habilitado
             if self.replication_enabled:
                 ensure_table(self.temperaturas_replica_table_name)
                 ensure_table(self.alertas_replica_table_name)
 
         except Exception as e:
             logger.warning(f"Não foi possível garantir criação de tabelas automaticamente: {e}")
+            # Não bloquear a inicialização por problemas de tabelas
     
     def _converter_decimal(self, obj):
         if isinstance(obj, Decimal):
@@ -124,6 +159,13 @@ class DynamoDBService:
     # TEMPERATURA
     
     def salvar_temperatura(self, id_sensor: str, temperatura: float, timestamp: str) -> Dict:
+        """Salva temperatura no DynamoDB"""
+        if not self.dynamodb:
+            return {}
+        
+        # Inicializar tabelas lazy se necessário
+        self._get_tables()
+        
         try:
             item_id = self._gerar_id_temperatura(id_sensor)
             
@@ -156,6 +198,9 @@ class DynamoDBService:
             raise
     
     def obter_ultima_temperatura(self) -> Optional[Dict]:
+        if not self.dynamodb:
+            return None
+        self._get_tables()
         try:
             response = self.temperaturas_table.scan(
                 FilterExpression='tipo_dado = :tipo',
@@ -177,6 +222,9 @@ class DynamoDBService:
             return None
     
     def obter_todas_temperaturas(self, limite: int = 100) -> List[Dict]:
+        if not self.dynamodb:
+            return []
+        self._get_tables()
         try:
             response = self.temperaturas_table.scan(
                 FilterExpression='tipo_dado = :tipo',
@@ -197,6 +245,9 @@ class DynamoDBService:
             return []
     
     def contar_temperaturas(self) -> int:
+        if not self.dynamodb:
+            return 0
+        self._get_tables()
         try:
             response = self.temperaturas_table.scan(
                 FilterExpression='tipo_dado = :tipo',
@@ -216,6 +267,9 @@ class DynamoDBService:
     
     def salvar_alerta(self, id_sensor: str, temperatura: float, tipo_alerta: str, 
                      mensagem: str, severidade: str) -> Dict:
+        if not self.dynamodb:
+            return {}
+        self._get_tables()
         try:
             item_id = self._gerar_id_alerta(tipo_alerta)
             fuso_brasilia = timezone(timedelta(hours=-3))
@@ -253,6 +307,9 @@ class DynamoDBService:
             raise
     
     def obter_todos_alertas(self, limite: int = 100) -> List[Dict]:
+        if not self.dynamodb:
+            return []
+        self._get_tables()
         try:
             response = self.alertas_table.scan(
                 FilterExpression='tipo_dado = :tipo',
@@ -274,6 +331,9 @@ class DynamoDBService:
             return []
     
     def obter_ultimo_alerta(self) -> Optional[Dict]:
+        if not self.dynamodb:
+            return None
+        self._get_tables()
         try:
             response = self.alertas_table.scan(
                 FilterExpression='tipo_dado = :tipo',
@@ -296,6 +356,9 @@ class DynamoDBService:
             return None
     
     def contar_alertas(self) -> Dict:
+        if not self.dynamodb:
+            return {'total': 0}
+        self._get_tables()
         try:
             # Contar os alertas
             response = self.alertas_table.scan(
@@ -361,6 +424,12 @@ class DynamoDBService:
         """Tenta adquirir o lease de líder salvando um item na tabela de alertas.
         Apenas uma instância deve conseguir por vez (condicional atômica).
         """
+        if not self.dynamodb:
+            return False
+        
+        # Inicializar tabelas lazy se necessário
+        self._get_tables()
+        
         try:
             fuso_brasilia = timezone(timedelta(hours=-3))
             agora = datetime.now(fuso_brasilia)
@@ -392,6 +461,12 @@ class DynamoDBService:
             return False
 
     def renovar_lease_lider(self, owner_id: str, ttl_seconds: int = 20) -> bool:
+        if not self.dynamodb:
+            return False
+        
+        # Inicializar tabelas lazy se necessário
+        self._get_tables()
+        
         try:
             fuso_brasilia = timezone(timedelta(hours=-3))
             agora = datetime.now(fuso_brasilia)
@@ -418,6 +493,12 @@ class DynamoDBService:
             return False
 
     def sou_lider(self, owner_id: str) -> bool:
+        if not self.dynamodb:
+            return False
+        
+        # Inicializar tabelas lazy se necessário
+        self._get_tables()
+        
         try:
             resp = self.alertas_table.get_item(Key={'id': 'leader#collector'})
             item = resp.get('Item')
@@ -430,6 +511,12 @@ class DynamoDBService:
     def marcar_alerta_notificado_uma_vez(self, alerta_id: str) -> bool:
         """Marca alerta como notificado usando Update condicional. Retorna True somente
         se conseguiu marcar agora (ou seja, ninguém marcou antes)."""
+        if not self.dynamodb:
+            return False
+        
+        # Inicializar tabelas lazy se necessário
+        self._get_tables()
+        
         try:
             self.alertas_table.update_item(
                 Key={'id': alerta_id},
@@ -452,6 +539,12 @@ class DynamoDBService:
     
     def obter_alertas_pendentes_notificacao(self, limite: int = 50) -> List[Dict]:
         """Obtém alertas não notificados ordenados por prioridade (MEDIO > ALTO > CRITICO)"""
+        if not self.dynamodb:
+            return []
+        
+        # Inicializar tabelas lazy se necessário
+        self._get_tables()
+        
         try:
             # Buscar todos os alertas
             response = self.alertas_table.scan(
