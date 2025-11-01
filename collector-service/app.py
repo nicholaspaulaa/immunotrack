@@ -12,6 +12,9 @@ import socket
 
 from dynamodb_basic import DynamoDBService
 from notificacoes_aws import notificar_alerta_critico
+from service_discovery import ServiceDiscovery, initialize_service_discovery
+from sqs_client import SQSClient, SQSMessageHandler, initialize_sqs_client
+from mqtt_subscriber import MQTTCollectorSubscriber
 
 # Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
@@ -56,7 +59,14 @@ owner_id = socket.gethostname()
 is_lider_atual = False
 LEASE_TTL_SECONDS = int(os.getenv('LEADER_TTL_SECONDS', '20'))
 
+# Service Discovery e SQS
+service_discovery = None
+sqs_client = None
+sqs_handler = None
+mqtt_subscriber = None
+
 async def _loop_eleicao_lider():
+    """Loop de eleição de líder e processamento de fila de notificações"""
     global is_lider_atual
     # Jitter inicial
     await asyncio.sleep(1)
@@ -72,23 +82,140 @@ async def _loop_eleicao_lider():
                 if not renovou:
                     logger.warning("[LIDERANCA] Perdi a liderança")
                     is_lider_atual = False
+                else:
+                    # Líder processa fila de notificações pendentes em ordem de prioridade
+                    if db_service:
+                        alertas_pendentes = db_service.obter_alertas_pendentes_notificacao(limite=10)
+                        for alerta_pendente in alertas_pendentes:
+                            try:
+                                alerta_id = alerta_pendente.get('id') or alerta_pendente.get('id_alerta')
+                                if alerta_id and db_service.marcar_alerta_notificado_uma_vez(alerta_id):
+                                    notificar_alerta_aws(alerta_pendente)
+                                    logger.info(f"[LIDER] Processou notificação pendente {alerta_id} (prioridade: {alerta_pendente.get('severidade', 'N/A')})")
+                            except Exception as e:
+                                logger.error(f"Erro ao processar alerta pendente: {e}")
         except Exception as e:
             logger.error(f"[LIDERANCA] Erro no loop de eleição: {e}")
         # Pequeno jitter para evitar sincronização
         await asyncio.sleep(max(5, LEASE_TTL_SECONDS // 2))
 
+def _processar_mensagem_mqtt(topic: str, payload: dict):
+    """Processa mensagens recebidas via MQTT"""
+    try:
+        # Extrair tipo da mensagem do tópico ou payload
+        if 'temperatura' in topic:
+            sensor_id = payload.get('sensor_id')
+            temperatura = float(payload.get('temperatura', 0))
+            timestamp = payload.get('timestamp', datetime.now(timezone(timedelta(hours=-3))).isoformat())
+            
+            # Criar objeto DadosTemperatura
+            dados = DadosTemperatura(
+                id_sensor=sensor_id,
+                temperatura=temperatura,
+                timestamp=timestamp
+            )
+            
+            # Processar como se fosse recebido via HTTP
+            receber_temperatura(dados)
+            logger.info(f"[MQTT] Processada temperatura do sensor {sensor_id} via MQTT")
+            
+        elif 'alerta' in topic:
+            logger.warning(f"[MQTT] Alerta recebido via MQTT: {payload.get('mensagem', 'N/A')}")
+            
+    except Exception as e:
+        logger.error(f"Erro ao processar mensagem MQTT: {e}")
+
+async def _processar_mensagens_sqs(message_body: dict) -> bool:
+    """Processa mensagens recebidas do SQS"""
+    try:
+        message_type = message_body.get('tipo', 'temperatura')
+        
+        if message_type == 'temperatura':
+            # Processar dados de temperatura
+            id_sensor = message_body.get('id_sensor')
+            temperatura = float(message_body.get('temperatura', 0))
+            timestamp = message_body.get('timestamp', datetime.now(timezone(timedelta(hours=-3))).isoformat())
+            
+            # Salvar no DynamoDB
+            if db_service:
+                db_service.salvar_temperatura(id_sensor, temperatura, timestamp)
+            
+            # Validar e criar alerta se necessário
+            if temperatura < 2.0 or temperatura > 8.0:
+                criar_alerta_emergencia(
+                    id_sensor=id_sensor,
+                    temperatura=temperatura,
+                    tipo_alerta="TEMPERATURA_CRITICA",
+                    mensagem=f"Temperatura crítica detectada: {temperatura}°C"
+                )
+            
+            logger.info(f"[SQS] Processada mensagem de temperatura do sensor {id_sensor}")
+            return True
+            
+        elif message_type == 'alerta':
+            # Processar alerta
+            logger.info(f"[SQS] Processada mensagem de alerta: {message_body.get('mensagem', 'N/A')}")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Erro ao processar mensagem SQS: {e}")
+        return False
+
 @app.on_event("startup")
 async def on_startup():
-    global db_service
+    global db_service, service_discovery, sqs_client, sqs_handler, mqtt_subscriber
+    
+    # Inicializar DynamoDB
     db_service = DynamoDBService()
+    
+    # Inicializar Service Discovery
+    try:
+        service_discovery = initialize_service_discovery()
+        if service_discovery:
+            logger.info("[SERVICE_DISCOVERY] Inicializado")
+    except Exception as e:
+        logger.warning(f"[SERVICE_DISCOVERY] Não inicializado: {e}")
+    
+    # Inicializar SQS Client
+    try:
+        sqs_client = initialize_sqs_client()
+        if sqs_client:
+            logger.info("[SQS] Cliente inicializado")
+            # Criar handler para processar mensagens
+            sqs_handler = SQSMessageHandler(sqs_client, _processar_mensagens_sqs)
+            # Iniciar processamento assíncrono de mensagens
+            asyncio.create_task(sqs_handler.start_processing())
+            logger.info("[SQS] Handler iniciado")
+    except Exception as e:
+        logger.warning(f"[SQS] Não inicializado: {e}")
+    
+    # Inicializar MQTT Subscriber
+    use_mqtt = os.getenv('USE_MQTT', 'false').lower() == 'true'
+    if use_mqtt:
+        try:
+            mqtt_subscriber = MQTTCollectorSubscriber(
+                callback_function=_processar_mensagem_mqtt
+            )
+            if mqtt_subscriber.connect():
+                logger.info("[MQTT] Subscriber conectado e pronto")
+            else:
+                logger.warning("[MQTT] Falha ao conectar subscriber")
+                mqtt_subscriber = None
+        except Exception as e:
+            logger.warning(f"[MQTT] Não inicializado: {e}")
+    
+    # Iniciar loop de eleição de líder
     asyncio.create_task(_loop_eleicao_lider())
 
 def notificar_alerta_aws(alerta_dict):
     """Envia notificação via AWS SNS para alertas críticos"""
     try:
-        # Verificar se AWS está configurado
-        if not os.getenv('AWS_ACCESS_KEY_ID'):
-            logger.warning("AWS não configurado - configure suas credenciais no arquivo .env")
+        # Verificar se SNS Topic ARN está configurado
+        topic_arn = os.getenv('SNS_TOPIC_ARN_EMAIL')
+        if not topic_arn:
+            logger.warning("SNS_TOPIC_ARN_EMAIL não configurado - notificações não serão enviadas")
             return False
 
         notificar_alerta_critico(alerta_dict)
@@ -152,19 +279,19 @@ def criar_alerta_emergencia(id_sensor: str, temperatura: float, tipo_alerta: str
     except Exception as e:
         logger.error(f"Erro ao salvar alerta no DynamoDB: {e}")
 
-    # Enviar notificação AWS para alertas críticos somente se líder e send-once
-    if severidade == "CRITICO":
-        try:
-            if db_service and is_lider_atual:
-                if db_service.marcar_alerta_notificado_uma_vez(alerta.id_alerta):
-                    notificar_alerta_aws(alerta.dict())
-                else:
-                    logger.info("Notificação já enviada por outra instância")
-            elif is_lider_atual:
-                # Sem DB (fallback): envia mesmo assim
-                notificar_alerta_aws(alerta.dict())
-        except Exception as e:
-            logger.error(f"Erro ao processar notificação crítica: {e}")
+    # Enviar notificação AWS baseado em prioridade e liderança
+    # Apenas o líder processa notificações para evitar duplicatas
+    if db_service and is_lider_atual:
+        # Verificar se conseguiu marcar como notificado (mutual exclusion)
+        if db_service.marcar_alerta_notificado_uma_vez(alerta.id_alerta):
+            # Enviar notificação ordenada por prioridade
+            notificar_alerta_aws(alerta.dict())
+            logger.info(f"[LIDER] Notificação enviada para alerta {severidade}: {alerta.id_alerta}")
+        else:
+            logger.info(f"[LIDER] Notificação já enviada por outra instância para {alerta.id_alerta}")
+    elif is_lider_atual:
+        # Sem DB (fallback): envia mesmo assim
+        notificar_alerta_aws(alerta.dict())
     
     return alerta
 
@@ -214,6 +341,36 @@ def pagina_saude():
     fuso_brasilia = timezone(timedelta(hours=-3))
     agora_brasilia = datetime.now(fuso_brasilia)
     
+    # Buscar dados dos sensores
+    dados_origem = (db_service.obter_todas_temperaturas(limite=100) if db_service else dados_temperatura)
+    
+    # Agrupar últimas leituras por sensor
+    leituras = {}
+    sensores_alvo = set()
+    
+    if dados_origem:
+        for d in dados_origem:
+            sid = d.get('id_sensor', 'desconhecido')
+            if sid != 'sensor-001':
+                sensores_alvo.add(sid)
+                # Manter apenas a última leitura de cada sensor
+                if sid not in leituras:
+                    leituras[sid] = d
+                else:
+                    # Comparar timestamps para manter a mais recente
+                    ts_atual = leituras[sid].get('data_criacao', leituras[sid].get('timestamp', ''))
+                    ts_novo = d.get('data_criacao', d.get('timestamp', ''))
+                    if ts_novo > ts_atual:
+                        leituras[sid] = d
+    
+    # Garantir que temos pelo menos os sensores esperados
+    sensores_esperados = ['salaA-sensor01', 'salaB-sensor02', 'salaC-sensor03']
+    for sid in sensores_esperados:
+        if sid not in sensores_alvo:
+            sensores_alvo.add(sid)
+    
+    sensores_alvo = sorted(sensores_alvo)
+    
     # Construir HTML dos cartões dos sensores sem f-strings aninhadas
     sensor_blocks = []
     for sid in sensores_alvo:
@@ -223,7 +380,7 @@ def pagina_saude():
             if item else "<div class='kv'><span>Temperatura</span><span>--</span></div>"
         )
         last_line = (
-            f"<div class='kv'><span>Último</span><span>{item['timestamp']}</span></div>"
+            f"<div class='kv'><span>Último</span><span>{item.get('timestamp', item.get('data_criacao', 'Sem dados'))}</span></div>"
             if item else "<div class='kv'><span>Último</span><span>Sem dados</span></div>"
         )
         block = (
@@ -308,7 +465,28 @@ def pagina_temperaturas():
 
 @app.get("/alertas-pagina", response_class=HTMLResponse, tags=["Visual"])
 def pagina_alertas():
-    """Página amigável para mostrar alertas"""
+    """Página amigável para mostrar alertas ordenados por prioridade"""
+    # Buscar alertas do DynamoDB ou memória
+    alertas_origem = (db_service.obter_todos_alertas(limite=100) if db_service else alertas_emergencia)
+    
+    # Filtrar apenas não resolvidos
+    alertas_nao_resolvidos = [a for a in alertas_origem if not a.get('resolvido', False)]
+    
+    # Ordenar por prioridade: MEDIO > ALTO > CRITICO
+    prioridade_map = {'MEDIO': 3, 'ALTO': 2, 'CRITICO': 1}
+    def prioridade_key(alerta):
+        severidade = alerta.get('severidade', 'MEDIO')
+        prioridade = prioridade_map.get(severidade, 0)
+        timestamp = alerta.get('timestamp') or alerta.get('data_criacao', '')
+        return (-prioridade, timestamp)  # Negativo para ordem decrescente
+    
+    alertas_ordenados = sorted(alertas_nao_resolvidos, key=prioridade_key, reverse=True)
+    
+    # Contar por prioridade
+    total_critico = len([a for a in alertas_ordenados if a.get('severidade') == 'CRITICO'])
+    total_alto = len([a for a in alertas_ordenados if a.get('severidade') == 'ALTO'])
+    total_medio = len([a for a in alertas_ordenados if a.get('severidade') == 'MEDIO'])
+    
     conteudo = f"""
     <!DOCTYPE html>
     <html>
@@ -321,24 +499,45 @@ def pagina_alertas():
             .alert-critico {{ background: #ffebee; border-left: 5px solid #e74c3c; }}
             .alert-alto {{ background: #fff3e0; border-left: 5px solid #f39c12; }}
             .alert-medio {{ background: #f3e5f5; border-left: 5px solid #9c27b0; }}
-            .back-btn {{ background: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }}
+            .back-btn {{ background: #3498db; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 20px; }}
+            .priority-badge {{ display: inline-block; padding: 5px 12px; border-radius: 12px; font-size: 11px; font-weight: bold; margin-left: 10px; }}
+            .badge-critico {{ background: #e74c3c; color: white; }}
+            .badge-alto {{ background: #f39c12; color: white; }}
+            .badge-medio {{ background: #9c27b0; color: white; }}
+            .stats {{ margin: 20px 0; padding: 15px; background: #ecf0f1; border-radius: 8px; }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>Alertas de Emergência</h1>
-            <p><strong>Total de alertas:</strong> {len(alertas_emergencia)}</p>
+            <div class="stats">
+                <p><strong>Total de alertas não resolvidos:</strong> {len(alertas_ordenados)}</p>
+                <p><strong>MÉDIOS:</strong> {total_medio} | <strong>ALTOS:</strong> {total_alto} | <strong>CRÍTICOS:</strong> {total_critico}</p>
+                <p style="color: #7f8c8d; font-size: 12px;">Ordenado por prioridade: MÉDIO → ALTO → CRÍTICO</p>
+            </div>
     """
     
-    for alerta in alertas_emergencia[-5:]:  # Mostrar últimos 5
-        classe = f"alert-{alerta['severidade'].lower()}"
-        conteudo += f"""
+    if alertas_ordenados:
+        for alerta in alertas_ordenados:
+            classe = f"alert-{alerta.get('severidade', 'MEDIO').lower()}"
+            badge_classe = f"badge-{alerta.get('severidade', 'MEDIO').lower()}"
+            severidade = alerta.get('severidade', 'MEDIO')
+            conteudo += f"""
             <div class="alert-item {classe}">
-                <h3>{alerta['tipo_alerta']} - {alerta['severidade']}</h3>
-                <p><strong>Sensor:</strong> {alerta['id_sensor']}</p>
-                <p><strong>Temperatura:</strong> {alerta['temperatura']}°C</p>
-                <p><strong>Mensagem:</strong> {alerta['mensagem']}</p>
-                <p><strong>Horário:</strong> {alerta['timestamp']}</p>
+                <h3>
+                    {alerta.get('tipo_alerta', 'Alerta')} 
+                    <span class="priority-badge {badge_classe}">{severidade}</span>
+                </h3>
+                <p><strong>Sensor:</strong> {alerta.get('id_sensor', 'N/A')}</p>
+                <p><strong>Temperatura:</strong> {alerta.get('temperatura', 0)}°C</p>
+                <p><strong>Mensagem:</strong> {alerta.get('mensagem', 'N/A')}</p>
+                <p><strong>Horário:</strong> {alerta.get('timestamp', alerta.get('data_criacao', 'N/A'))}</p>
+            </div>
+            """
+    else:
+        conteudo += """
+            <div style="padding: 20px; text-align: center; color: #7f8c8d;">
+                <p>Nenhum alerta pendente.</p>
             </div>
         """
     
@@ -437,9 +636,20 @@ def painel_visual(request: Request):
     else:
         temp_media = temp_min = temp_max = 0
     
-    # Estatísticas de alertas (filtrar alertas resolvidos)
+    # Estatísticas de alertas (filtrar alertas resolvidos e ordenar por prioridade)
     alertas_origem = (db_service.obter_todos_alertas(limite=50) if db_service else alertas_emergencia)
     alertas_nao_resolvidos = [a for a in alertas_origem if not a.get('resolvido', False)]
+    
+    # Ordenar por prioridade: MEDIO > ALTO > CRITICO
+    prioridade_map = {'MEDIO': 3, 'ALTO': 2, 'CRITICO': 1}
+    def prioridade_key(alerta):
+        severidade = alerta.get('severidade', 'MEDIO')
+        prioridade = prioridade_map.get(severidade, 0)
+        timestamp = alerta.get('timestamp') or alerta.get('data_criacao', '')
+        return (-prioridade, timestamp)  # Negativo para ordem decrescente
+    
+    alertas_nao_resolvidos = sorted(alertas_nao_resolvidos, key=prioridade_key, reverse=True)
+    
     total_alertas = len(alertas_nao_resolvidos)
     alertas_criticos = len([a for a in alertas_nao_resolvidos if a['severidade'] == 'CRITICO'])
     ultimo_alerta = alertas_nao_resolvidos[0] if alertas_nao_resolvidos else None
@@ -501,8 +711,16 @@ def painel_visual(request: Request):
     try:
         if db_service:
             todos_alertas = db_service.obter_todos_alertas(limite=200)
-            # Filtrar apenas alertas não resolvidos
+            # Filtrar apenas alertas não resolvidos e ordenar por prioridade
             alertas_nao_resolvidos = [a for a in todos_alertas if not a.get('resolvido', False)]
+            # Ordenar por prioridade: MEDIO > ALTO > CRITICO
+            prioridade_map = {'MEDIO': 3, 'ALTO': 2, 'CRITICO': 1}
+            def prioridade_key_graficos(a):
+                severidade = a.get('severidade', 'MEDIO')
+                prioridade = prioridade_map.get(severidade, 0)
+                timestamp = a.get('timestamp') or a.get('data_criacao', '')
+                return (-prioridade, timestamp)
+            alertas_nao_resolvidos = sorted(alertas_nao_resolvidos, key=prioridade_key_graficos, reverse=True)
             for alerta in alertas_nao_resolvidos:
                 sensor_id_alert = alerta.get('id_sensor', '')
                 if sensor_id_alert not in alertas_por_sensor:
@@ -1459,10 +1677,45 @@ def verificar_saude():
 
 @app.post("/api/temperatura", tags=["Temperatura"])
 def receber_temperatura(dados: DadosTemperatura):
+    """
+    Recebe dados de temperatura dos sensores
+    Opcionalmente envia para SQS se configurado (para processamento assíncrono)
+    """
     try:
-        # SEMPRE salvar a leitura, independente de estar dentro ou fora da faixa
         logger.info(f"Recebido dados do sensor {dados.id_sensor}: {dados.temperatura}°C")
+        
+        # Opcionalmente enviar para SQS para processamento assíncrono
+        use_sqs = os.getenv('USE_SQS_FOR_TEMPERATURE', 'false').lower() == 'true'
+        
+        if use_sqs and sqs_client:
+            # Determinar prioridade baseada na temperatura
+            priority = 'HIGH' if (dados.temperatura < 2.0 or dados.temperatura > 8.0) else 'NORMAL'
+            
+            # Enviar para SQS
+            message_body = {
+                'tipo': 'temperatura',
+                'id_sensor': dados.id_sensor,
+                'temperatura': dados.temperatura,
+                'timestamp': dados.timestamp
+            }
+            
+            message_id = sqs_client.send_message(
+                message_body=message_body,
+                priority=priority
+            )
+            
+            if message_id:
+                logger.info(f"[SQS] Mensagem enviada para fila {priority} (ID: {message_id})")
+                return {
+                    "mensagem": "Dados recebidos e enfileirados",
+                    "status": "ENQUEUED",
+                    "message_id": message_id,
+                    "queue_priority": priority
+                }
+        
+        # Processamento síncrono (comportamento padrão)
         dados_temperatura.append(dados.dict())
+        
         # Persistir no DynamoDB
         if db_service:
             try:
@@ -1483,6 +1736,22 @@ def receber_temperatura(dados: DadosTemperatura):
             )
             alerta_criado = True
             logger.warning(f"Temperatura fora da faixa segura: {dados.temperatura}°C (sensor: {dados.id_sensor})")
+            
+            # Enviar alerta para SQS de alta prioridade se configurado
+            if sqs_client:
+                alert_message = {
+                    'tipo': 'alerta',
+                    'id_sensor': dados.id_sensor,
+                    'temperatura': dados.temperatura,
+                    'tipo_alerta': 'TEMPERATURA_CRITICA',
+                    'mensagem': mensagem_alerta,
+                    'timestamp': dados.timestamp
+                }
+                sqs_client.send_message(
+                    message_body=alert_message,
+                    priority='HIGH'
+                )
+            
             return {
                 "mensagem": "Dados recebidos e alerta criado",
                 "status": "AVISO",
@@ -1524,6 +1793,126 @@ def obter_contador_dados():
     logger.info(f"Total de leituras: {contador}")
     return {"contador": contador, "mensagem": f"Total de {contador} leituras armazenadas"}
 
+@app.get("/api/distribuido/status", tags=["Distribuido"])
+def status_distribuido():
+    """Endpoint para verificar status do sistema distribuído"""
+    fuso_brasilia = timezone(timedelta(hours=-3))
+    agora_brasilia = datetime.now(fuso_brasilia)
+    
+    # Contar alertas pendentes de notificação se for líder
+    alertas_pendentes_count = 0
+    if is_lider_atual and db_service:
+        try:
+            alertas_pendentes = db_service.obter_alertas_pendentes_notificacao(limite=100)
+            alertas_pendentes_count = len(alertas_pendentes)
+        except:
+            pass
+    
+    status = {
+        "timestamp": agora_brasilia.isoformat(),
+        "instance_id": owner_id,
+        "is_leader": is_lider_atual,
+        "fila_notificacoes_pendentes": alertas_pendentes_count if is_lider_atual else 0,
+        "services": {}
+    }
+    
+    # Service Discovery Status
+    if service_discovery:
+        try:
+            discovered_services = service_discovery.discover_services()
+            status["services"]["service_discovery"] = {
+                "enabled": True,
+                "service_name": service_discovery.service_name,
+                "domain": service_discovery.domain_name,
+                "fqdn": service_discovery.service_fqdn,
+                "discovered_instances": discovered_services,
+                "instance_count": len(discovered_services)
+            }
+        except Exception as e:
+            status["services"]["service_discovery"] = {
+                "enabled": True,
+                "error": str(e)
+            }
+    else:
+        status["services"]["service_discovery"] = {
+            "enabled": False
+        }
+    
+    # SQS Status
+    if sqs_client:
+        try:
+            status["services"]["sqs"] = {
+                "enabled": True,
+                "high_priority_queue": sqs_client.high_priority_queue_url is not None,
+                "normal_queue": sqs_client.normal_queue_url is not None,
+                "handler_running": sqs_handler.running if sqs_handler else False
+            }
+        except Exception as e:
+            status["services"]["sqs"] = {
+                "enabled": True,
+                "error": str(e)
+            }
+    else:
+        status["services"]["sqs"] = {
+            "enabled": False
+        }
+    
+    # DynamoDB Status
+    if db_service:
+        try:
+            status["services"]["dynamodb"] = {
+                "enabled": True,
+                "region": db_service.region,
+                "endpoint": db_service.endpoint_url or "AWS Managed",
+                "replication_enabled": db_service.replication_enabled
+            }
+        except Exception as e:
+            status["services"]["dynamodb"] = {
+                "enabled": True,
+                "error": str(e)
+            }
+    else:
+        status["services"]["dynamodb"] = {
+            "enabled": False
+        }
+    
+    return status
+
+@app.get("/api/distribuido/discover", tags=["Distribuido"])
+def discover_services():
+    """Descobre todas as instâncias do serviço"""
+    if not service_discovery:
+        raise HTTPException(status_code=503, detail="Service Discovery não configurado")
+    
+    try:
+        instances = service_discovery.discover_services()
+        return {
+            "service_name": service_discovery.service_name,
+            "domain": service_discovery.domain_name,
+            "instances": instances,
+            "count": len(instances),
+            "current_instance": owner_id
+        }
+    except Exception as e:
+        logger.error(f"Erro ao descobrir serviços: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao descobrir serviços: {str(e)}")
+
+@app.get("/api/lideranca/fila-notificacoes", tags=["Distribuido"])
+def obter_fila_notificacoes():
+    """Retorna fila de notificações pendentes ordenada por prioridade"""
+    if not db_service:
+        return {"fila": [], "is_leader": is_lider_atual, "message": "DynamoDB não configurado"}
+    
+    alertas_pendentes = db_service.obter_alertas_pendentes_notificacao(limite=20)
+    
+    return {
+        "is_leader": is_lider_atual,
+        "instance_id": owner_id,
+        "fila_pendentes": alertas_pendentes,
+        "total_pendentes": len(alertas_pendentes),
+        "prioridade": "MEDIO > ALTO > CRITICO"
+    }
+
 @app.get("/api/graficos/dados", tags=["Graficos"])
 def obter_dados_graficos():
     """Retorna os dados necessários para atualizar os gráficos"""
@@ -1534,6 +1923,15 @@ def obter_dados_graficos():
         # Buscar alertas não resolvidos
         alertas_origem = (db_service.obter_todos_alertas(limite=200) if db_service else alertas_emergencia)
         alertas_nao_resolvidos = [a for a in alertas_origem if not a.get('resolvido', False)]
+        
+        # Ordenar por prioridade: MEDIO > ALTO > CRITICO
+        prioridade_map = {'MEDIO': 3, 'ALTO': 2, 'CRITICO': 1}
+        def prioridade_key(a):
+            severidade = a.get('severidade', 'MEDIO')
+            prioridade = prioridade_map.get(severidade, 0)
+            timestamp = a.get('timestamp') or a.get('data_criacao', '')
+            return (-prioridade, timestamp)
+        alertas_nao_resolvidos = sorted(alertas_nao_resolvidos, key=prioridade_key, reverse=True)
         
         # Agrupar alertas por sensor
         alertas_por_sensor = {}
@@ -1893,4 +2291,4 @@ def testar_notificacoes():
 
 if __name__ == "__main__":
     logger.info("Iniciando Serviço Coletor ImmunoTrack...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=80)

@@ -8,13 +8,36 @@ from datetime import datetime, timezone, timedelta
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import MQTT opcional
+try:
+    from mqtt_publisher import MQTTSensorPublisher
+    MQTT_AVAILABLE = True
+except ImportError:
+    MQTT_AVAILABLE = False
+    logger.warning("[MQTT] Módulo mqtt_publisher não disponível - usando HTTP apenas")
+
 class SensorTemperatura:
-    def __init__(self, id_sensor: str, url_coletor: str, intervalo: int = 10):
+    def __init__(self, id_sensor: str, url_coletor: str, intervalo: int = 10, use_mqtt: bool = False):
         self.id_sensor = id_sensor
         self.url_coletor = url_coletor
         self.intervalo = intervalo
         self.contador_tentativas = 0
         self.max_tentativas = 3
+        self.use_mqtt = use_mqtt and MQTT_AVAILABLE
+        self.mqtt_publisher = None
+        
+        # Inicializar MQTT se habilitado
+        if self.use_mqtt:
+            try:
+                self.mqtt_publisher = MQTTSensorPublisher()
+                if self.mqtt_publisher.connect():
+                    logger.info("[MQTT] Conectado ao broker MQTT")
+                else:
+                    logger.warning("[MQTT] Falha ao conectar - usando HTTP como fallback")
+                    self.use_mqtt = False
+            except Exception as e:
+                logger.error(f"[MQTT] Erro ao inicializar MQTT: {e}")
+                self.use_mqtt = False
         
     def gerar_temperatura(self) -> float:
         # Gerar apenas temperaturas normais (2°C - 8°C)
@@ -42,6 +65,25 @@ class SensorTemperatura:
         # Temperatura sempre normal (2°C - 8°C)
         # Alertas críticos são gerados apenas manualmente via botão no site
         
+        # Usar MQTT se habilitado
+        if self.use_mqtt and self.mqtt_publisher:
+            try:
+                sucesso = self.mqtt_publisher.publish_temperature(
+                    sensor_id=self.id_sensor,
+                    temperatura=temperatura,
+                    qos=1
+                )
+                if sucesso:
+                    logger.info(f"[MQTT] Dados enviados: {temperatura}°C")
+                    self.contador_tentativas = 0
+                    return True
+                else:
+                    logger.warning("[MQTT] Falha ao publicar - tentando HTTP como fallback")
+                    # Fallback para HTTP se MQTT falhar
+            except Exception as e:
+                logger.error(f"[MQTT] Erro ao publicar: {e} - tentando HTTP como fallback")
+        
+        # Usar HTTP REST (padrão ou fallback)
         payload = {
             "id_sensor": self.id_sensor,
             "temperatura": temperatura,
@@ -56,7 +98,7 @@ class SensorTemperatura:
             )
             
             if response.status_code == 200:
-                logger.info(f"Dados enviados: {temperatura}°C")
+                logger.info(f"[HTTP] Dados enviados: {temperatura}°C")
                 self.contador_tentativas = 0
                 return True
             else:
@@ -96,8 +138,9 @@ class SensorTemperatura:
 
 if __name__ == "__main__":
     ID_SENSOR = os.getenv("SENSOR_ID", "sensor-001")
-    URL_COLETOR = os.getenv("COLLECTOR_URL", "http://collector-service:8000")
+    URL_COLETOR = os.getenv("COLLECTOR_URL", "http://collector-service:80")
     INTERVALO = int(os.getenv("INTERVAL", "10"))
+    USE_MQTT = os.getenv("USE_MQTT", "false").lower() == "true"
     
-    sensor = SensorTemperatura(ID_SENSOR, URL_COLETOR, INTERVALO)
+    sensor = SensorTemperatura(ID_SENSOR, URL_COLETOR, INTERVALO, use_mqtt=USE_MQTT)
     sensor.iniciar()

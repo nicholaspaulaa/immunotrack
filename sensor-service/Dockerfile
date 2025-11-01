@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copiar código da aplicação
 COPY app.py .
+COPY mqtt_publisher.py .
 
 # Mudar para usuário não-root
 USER app

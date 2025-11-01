@@ -18,17 +18,13 @@ class DynamoDBService:
     def __init__(self):
         try:
 
-            # MUDAR TUDO DAS REGIOES PARA TESTES, SALVO PARA NAO SE PERDER
             self.region = os.getenv('AWS_REGION', 'us-east-1')
-            self.endpoint_url = os.getenv('AWS_DYNAMODB_ENDPOINT')  # ex.: http://dynamodb:8000 para local
+            self.endpoint_url = os.getenv('AWS_DYNAMODB_ENDPOINT')
             self.replication_enabled = os.getenv('REPLICATION_LOCAL_ENABLED', 'false').lower() == 'true'
             
-            # Conexão flexível: suporta AWS gerenciado e DynamoDB Local via endpoint_url
             session_kwargs = {
                 'region_name': self.region
             }
-            # Para ambiente AWS gerenciado, as credenciais podem vir do ambiente/role;
-            # para local com endpoint, não exigimos credenciais explícitas
             access_key = os.getenv('AWS_ACCESS_KEY_ID')
             secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
             if access_key and secret_key:
@@ -54,7 +50,7 @@ class DynamoDBService:
             
             logger.info(f"DynamoDB conectado na região {self.region}{' (endpoint local)' if self.endpoint_url else ''}")
 
-            # Garante que as tabelas existam (útil para DynamoDB Local e primeira execução)
+            # Garante que as tabelas existam
             self._ensure_tables_exist()
             
         except NoCredentialsError:
@@ -64,8 +60,6 @@ class DynamoDBService:
             logger.error(f"Erro ao conectar DynamoDB: {e}")
             raise
 
- # MUDAR TUDO DAS REGIOES PARA TESTES, SALVO PARA NAO SE PERDER
-    
     def testar_conexao(self):
         try:
             client = boto3.client('dynamodb', region_name=self.region, endpoint_url=self.endpoint_url) if self.endpoint_url else boto3.client('dynamodb', region_name=self.region)
@@ -104,7 +98,6 @@ class DynamoDBService:
                 ensure_table(self.alertas_replica_table_name)
 
         except Exception as e:
-            # Em ambientes com permissões restritas, apenas loga e segue em frente
             logger.warning(f"Não foi possível garantir criação de tabelas automaticamente: {e}")
     
     def _converter_decimal(self, obj):
@@ -146,7 +139,6 @@ class DynamoDBService:
             self.temperaturas_table.put_item(Item=item)
             logger.info(f"Temperatura salva: {temperatura}°C do sensor {id_sensor}")
             
-            # Write-through para réplica local (demonstração de replicação)
             if self.replication_enabled and self.temperaturas_replica_table is not None:
                 try:
                     self.temperaturas_replica_table.put_item(Item=item)
@@ -171,7 +163,6 @@ class DynamoDBService:
                 Limit=1000
             )
             
-            # Ordenar por tempo // recente
             items = response['Items']
             if items:
                 items.sort(key=lambda x: x['data_criacao'], reverse=True)
@@ -193,7 +184,6 @@ class DynamoDBService:
                 Limit=limite
             )
             
-            # Ordenar por tempo
             items = response['Items']
             items.sort(key=lambda x: x['data_criacao'], reverse=True)
             
@@ -246,7 +236,6 @@ class DynamoDBService:
             self.alertas_table.put_item(Item=item)
             logger.info(f"Alerta salvo: {tipo_alerta} - {severidade}")
             
-            # Write-through para réplica local (demonstração de replicação)
             if self.replication_enabled and self.alertas_replica_table is not None:
                 try:
                     self.alertas_replica_table.put_item(Item=item)
@@ -366,9 +355,7 @@ class DynamoDBService:
             logger.error(f"Erro inesperado ao marcar alerta como resolvido: {e}")
             return False
 
-    # =====================
     # Coordenação distribuída (eleição/locks)
-    # =====================
 
     def adquirir_lease_lider(self, owner_id: str, ttl_seconds: int = 20) -> bool:
         """Tenta adquirir o lease de líder salvando um item na tabela de alertas.
@@ -446,9 +433,12 @@ class DynamoDBService:
         try:
             self.alertas_table.update_item(
                 Key={'id': alerta_id},
-                UpdateExpression='SET notified = :true',
+                UpdateExpression='SET notified = :true, notified_at = :now',
                 ConditionExpression='attribute_not_exists(notified) OR notified <> :true',
-                ExpressionAttributeValues={':true': True}
+                ExpressionAttributeValues={
+                    ':true': True,
+                    ':now': datetime.now(timezone(timedelta(hours=-3))).isoformat()
+                }
             )
             return True
         except ClientError as e:
@@ -459,3 +449,32 @@ class DynamoDBService:
         except Exception as e:
             logger.error(f"Erro inesperado ao marcar notificado: {e}")
             return False
+    
+    def obter_alertas_pendentes_notificacao(self, limite: int = 50) -> List[Dict]:
+        """Obtém alertas não notificados ordenados por prioridade (MEDIO > ALTO > CRITICO)"""
+        try:
+            # Buscar todos os alertas
+            response = self.alertas_table.scan(
+                FilterExpression='attribute_not_exists(notified) OR notified <> :true',
+                ExpressionAttributeValues={':true': True},
+                Limit=limite
+            )
+            
+            alertas = response.get('Items', [])
+            
+            # Ordenar por prioridade: MEDIO > ALTO > CRITICO > outros
+            prioridade_map = {'MEDIO': 3, 'ALTO': 2, 'CRITICO': 1}
+            
+            def prioridade_key(alerta):
+                severidade = alerta.get('severidade', 'MEDIO')
+                prioridade = prioridade_map.get(severidade, 0)
+                timestamp = alerta.get('timestamp') or alerta.get('data_criacao', '')
+                return (-prioridade, timestamp)  # Negativo para ordem decrescente
+            
+            alertas_ordenados = sorted(alertas, key=prioridade_key, reverse=True)
+            
+            return [self._converter_decimal(a) for a in alertas_ordenados[:limite]]
+            
+        except Exception as e:
+            logger.error(f"Erro ao obter alertas pendentes: {e}")
+            return []

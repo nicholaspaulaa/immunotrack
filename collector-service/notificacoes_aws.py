@@ -16,24 +16,38 @@ class NotificadorAWS:
     def __init__(self):
         """Inicializa o cliente AWS SNS"""
         try:
-            # Configurar região AWS
             self.region = os.getenv('AWS_REGION', 'us-east-1')
             
-            # Criar cliente SNS
-            # Usa credenciais padrão do ambiente/role. Se AWS_ACCESS_KEY_ID/SECRET estiverem no env,
-            # o boto3 as usará automaticamente; não passamos valores hardcoded.
-            self.sns_client = boto3.client(
-                'sns',
-                region_name=self.region
-            )
-            
-            # Número de telefone para notificações
-            self.numero_telefone = os.getenv('TELEFONE_NOTIFICACAO')
-            
-            # Email para notificações
             self.email_notificacao = os.getenv('EMAIL_NOTIFICACAO')
             
-            logger.info("Cliente AWS SNS configurado com sucesso")
+            self.topic_arn_email = os.getenv('SNS_TOPIC_ARN_EMAIL')
+            
+            aws_access_key = os.getenv('AWS_ACCESS_KEY_ID', '')
+            aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY', '')
+            
+            if aws_access_key == 'local' or aws_secret_key == 'local':
+                logger.info("Ambiente local detectado - SNS desabilitado (credenciais 'local')")
+                logger.info("Para testar notificações, configure credenciais AWS válidas ou faça deploy na AWS")
+                self.sns_client = None
+                return
+            
+            try:
+                self.sns_client = boto3.client(
+                    'sns',
+                    region_name=self.region
+                )
+                logger.info(f"Cliente AWS SNS configurado (região: {self.region})")
+                
+                if self.email_notificacao and self.topic_arn_email:
+                    try:
+                        self.inscrever_email(self.email_notificacao, self.topic_arn_email)
+                    except Exception as e:
+                        logger.debug(f"Email já pode estar inscrito ou erro ao inscrever: {e}")
+            except Exception as e:
+                logger.warning(f"Cliente SNS não inicializado: {e}")
+                self.sns_client = None
+            
+            self.numero_telefone = os.getenv('TELEFONE_NOTIFICACAO')
             
         except Exception as e:
             logger.error(f"Erro ao configurar AWS SNS: {e}")
@@ -46,7 +60,6 @@ class NotificadorAWS:
             return False
         
         try:
-            # Formatar mensagem
             mensagem = f"""
 ALERTA CRÍTICO IMMUNOTRACK
 
@@ -60,7 +73,7 @@ Horário: {alerta['timestamp']}
 Ação necessária: Verificar refrigerador imediatamente!
             """.strip()
             
-            # Enviar SMS
+            # Enviar SMS (não usado)
             response = self.sns_client.publish(
                 PhoneNumber=self.numero_telefone,
                 Message=mensagem,
@@ -81,7 +94,6 @@ Ação necessária: Verificar refrigerador imediatamente!
             return False
         
         try:
-            # Formatar mensagem texto (compatível com assinaturas por email do SNS)
             mensagem_texto = (
                 "ALERTA IMMUNOTRACK\n\n"
                 f"Tipo: {alerta['tipo_alerta']}\n"
@@ -109,7 +121,6 @@ Ação necessária: Verificar refrigerador imediatamente!
     
     def get_topic_arn_email(self):
         """Obtém o ARN do tópico SNS para email"""
-        # Coloque o ARN do email
         return os.getenv('SNS_TOPIC_ARN_EMAIL', 'arn:aws:sns:us-east-1:123456789012:immunotrack-alerts')
     
     def criar_topico_sns(self, nome_topico):
@@ -124,16 +135,38 @@ Ação necessária: Verificar refrigerador imediatamente!
             return None
     
     def inscrever_email(self, email, topic_arn):
-        """Inscreve um email no tópico SNS"""
+        """Inscreve um email no tópico SNS (se não estiver já inscrito)"""
+        if not self.sns_client:
+            logger.warning("Cliente SNS não configurado - não é possível inscrever email")
+            return False
+            
         try:
+            try:
+                subscriptions = self.sns_client.list_subscriptions_by_topic(TopicArn=topic_arn)
+                for sub in subscriptions.get('Subscriptions', []):
+                    if sub.get('Endpoint') == email and sub.get('Protocol') == 'email':
+                        if sub.get('SubscriptionArn') != 'PendingConfirmation':
+                            logger.info(f"Email {email} já está inscrito e confirmado")
+                            return True
+                        else:
+                            logger.info(f"Email {email} está pendente de confirmação - verifique sua caixa de entrada")
+                            return False
+            except Exception:
+                pass 
+            
             response = self.sns_client.subscribe(
                 TopicArn=topic_arn,
                 Protocol='email',
                 Endpoint=email
             )
-            logger.info(f"Email {email} inscrito no tópico: {response['SubscriptionArn']}")
+            logger.info(f"Email {email} inscrito no tópico. SubscriptionArn: {response.get('SubscriptionArn', 'Pendente')}")
+            logger.warning(f"IMPORTANTE: Confirme o email no link enviado para {email} pela AWS SNS!")
             return True
         except Exception as e:
+            error_code = e.response.get('Error', {}).get('Code', '') if hasattr(e, 'response') else ''
+            if 'already subscribed' in str(e).lower() or error_code == 'InvalidParameter':
+                logger.info(f"Email {email} já pode estar inscrito no tópico")
+                return True
             logger.error(f"Erro ao inscrever email: {e}")
             return False
 

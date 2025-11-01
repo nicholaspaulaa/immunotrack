@@ -2,55 +2,63 @@ services:
   collector-service:
     build: ./collector-service
     ports:
-      - "8000:8000"
+      - "80:80"
     env_file:
       - ./collector-service/.env
     environment:
       - PYTHONUNBUFFERED=1
-      - AWS_REGION=us-east-1
-      - AWS_DYNAMODB_ENDPOINT=http://dynamodb:8000
-      - AWS_ACCESS_KEY_ID=local
-      - AWS_SECRET_ACCESS_KEY=local
-      - REPLICATION_LOCAL_ENABLED=false
-      - EMAIL_NOTIFICACAO=icraftgamer@gmail.com
-      - SNS_TOPIC_ARN_EMAIL=arn:aws:sns:us-east-1:985798502313:immunotrack-alerts
-      - DEBUG=True
-      - LOG_LEVEL=INFO
+      # Variáveis AWS - se não definidas no .env, usar valores padrão abaixo
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      # Para LOCAL: definir AWS_DYNAMODB_ENDPOINT=http://dynamodb:8000 no .env
+      # Para AWS: NÃO definir AWS_DYNAMODB_ENDPOINT no .env (usa AWS gerenciado)
+      - AWS_DYNAMODB_ENDPOINT=${AWS_DYNAMODB_ENDPOINT:-}
+      # Para LOCAL: definir AWS_ACCESS_KEY_ID=local no .env
+      # Para AWS: NÃO definir (usa IAM Role)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - REPLICATION_LOCAL_ENABLED=${REPLICATION_LOCAL_ENABLED:-false}
+      # Email e SNS ARN devem vir do arquivo .env
+      - DEBUG=${DEBUG:-False}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # MQTT
+      - USE_MQTT=${USE_MQTT:-true}
+      # Para LOCAL: usar MQTT_BROKER_HOST=mosquitto
+      # Para AWS: usar MQTT_BROKER_HOST=mosquitto.internal.immunotrack.local ou AWS IoT Core endpoint
+      - MQTT_BROKER_HOST=${MQTT_BROKER_HOST:-mosquitto}
+      - MQTT_BROKER_PORT=${MQTT_BROKER_PORT:-1883}
     networks:
       - immunotrack-network
-    depends_on:
-      - dynamodb
+    # depends_on condicional baseado em variáveis de ambiente
+    # Se AWS_DYNAMODB_ENDPOINT não estiver definido, não depende de dynamodb local
+    depends_on: []
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/saude"]
+      test: ["CMD", "curl", "-f", "http://localhost:80/saude"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 5s
 
-  # Segundo coletor para visualizar liderança lado a lado (porta 8002)
+  # Segundo coletor para visualizar liderança lado a lado (porta 8080)
   collector-service-b:
     build: ./collector-service
     ports:
-      - "8002:8000"
+      - "8080:80"
     env_file:
       - ./collector-service/.env
     environment:
       - PYTHONUNBUFFERED=1
-      - AWS_REGION=us-east-1
-      - AWS_DYNAMODB_ENDPOINT=http://dynamodb:8000
-      - AWS_ACCESS_KEY_ID=local
-      - AWS_SECRET_ACCESS_KEY=local
-      - REPLICATION_LOCAL_ENABLED=false
-      - EMAIL_NOTIFICACAO=icraftgamer@gmail.com
-      - SNS_TOPIC_ARN_EMAIL=arn:aws:sns:us-east-1:985798502313:immunotrack-alerts
-      - DEBUG=True
-      - LOG_LEVEL=INFO
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_DYNAMODB_ENDPOINT=${AWS_DYNAMODB_ENDPOINT:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - REPLICATION_LOCAL_ENABLED=${REPLICATION_LOCAL_ENABLED:-false}
+      - DEBUG=${DEBUG:-False}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     networks:
       - immunotrack-network
-    depends_on:
-      - dynamodb
+    depends_on: []
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/saude"]
+      test: ["CMD", "curl", "-f", "http://localhost:80/saude"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -60,39 +68,57 @@ services:
   sensor-salaa:
     build: ./sensor-service
     environment:
-      - COLLECTOR_URL=http://collector-service:8000
+      - COLLECTOR_URL=http://collector-service:80
       - SENSOR_ID=salaA-sensor01
       - INTERVAL=3
       - PYTHONUNBUFFERED=1
+      # MQTT
+      - USE_MQTT=true
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
     networks:
       - immunotrack-network
     depends_on:
+      mosquitto:
+        condition: service_started
       collector-service:
         condition: service_healthy
 
   sensor-salab:
     build: ./sensor-service
     environment:
-      - COLLECTOR_URL=http://collector-service:8000
+      - COLLECTOR_URL=http://collector-service:80
       - SENSOR_ID=salaB-sensor02
       - INTERVAL=3
       - PYTHONUNBUFFERED=1
+      # MQTT
+      - USE_MQTT=true
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
     networks:
       - immunotrack-network
     depends_on:
+      mosquitto:
+        condition: service_started
       collector-service:
         condition: service_healthy
 
   sensor-salac:
     build: ./sensor-service
     environment:
-      - COLLECTOR_URL=http://collector-service:8000
+      - COLLECTOR_URL=http://collector-service:80
       - SENSOR_ID=salaC-sensor03
       - INTERVAL=3
       - PYTHONUNBUFFERED=1
+      # MQTT
+      - USE_MQTT=true
+      - MQTT_BROKER_HOST=mosquitto
+      - MQTT_BROKER_PORT=1883
     networks:
       - immunotrack-network
     depends_on:
+      mosquitto:
+        condition: service_started
       collector-service:
         condition: service_healthy
 
@@ -105,6 +131,28 @@ services:
     networks:
       - immunotrack-network
 
+  # MQTT Broker (Mosquitto)
+  mosquitto:
+    build: ./mqtt-broker
+    ports:
+      - "1883:1883"  # MQTT
+      - "9001:9001"  # MQTT over WebSockets
+    volumes:
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    networks:
+      - immunotrack-network
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/$$", "-C", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
 networks:
   immunotrack-network:
     driver: bridge
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
